@@ -220,7 +220,7 @@
  C:/Users/lvegn/.platformio/packages/framework-arduinoespressif32/libraries/WiFi/src/WiFiServer.h \
  C:/Users/lvegn/OneDrive/Documents/Repos/Robots/Ash-Nazg/Code/Libraries/NetApiHelpers/src/ServerTemplate.h \
  C:/Users/lvegn/.platformio/packages/framework-arduinoespressif32/libraries/EEPROM/src/EEPROM.h \
- src/DShotESC.h \
+ C:/Users/lvegn/OneDrive/Documents/Repos/Robots/Ash-Nazg/Code/Libraries/DShotRMT/DShotRMT.h \
  C:/Users/lvegn/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s2/include/driver/include/driver/rmt.h \
  C:/Users/lvegn/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s2/include/esp_ringbuf/include/freertos/ringbuf.h \
  C:/Users/lvegn/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s2/include/soc/esp32s2/include/soc/rmt_struct.h \

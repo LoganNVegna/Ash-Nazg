@@ -20,7 +20,7 @@
 #include <ArduinoOTA.h>
 #include <TelnetStream.h>
 #include <EEPROM.h>
-#include "DShotESC.h"
+#include <DShotRMT.h>
 
 //------accelerometer config------------
 #define ACCEL_MAX_SCALE 400  // 400g range
@@ -122,12 +122,12 @@ void i2c_read_task(void *pvParameters) {
 }
 
 //-------ESC config (ESP32-S2 Mini)--------
-// ESP32-S2 Mini safe pins: 1-8, 17, 18, 21
-#define escR_gpio GPIO_NUM_3  //right esc pin (safe)
-#define escL_gpio GPIO_NUM_4  //left esc pin (safe)
-DShotESC escR;  // create servo object to control the right esc
-DShotESC escL;  // create servo object to control the left esc
-//library uses values between -999 and 999 to control speed of esc
+// DShotRMT (dshot300 pattern): GPIO + RMT channel, begin(DSHOT300), sendThrottleValue(48–2047)
+// We use sendThrottle3D(-999..999) -> 48–2047; sendMotorStop() = 0 for arm; sendCommand for 3D/reverse.
+#define escR_gpio GPIO_NUM_3  // right ESC pin (safe)
+#define escL_gpio GPIO_NUM_4  // left ESC pin (safe)
+DShotRMT escR(escR_gpio, RMT_CHANNEL_3);
+DShotRMT escL(escL_gpio, RMT_CHANNEL_2);
 
 //---------Pin assignments (ESP32-S2 Mini)----------
 // Available GPIOs: 1-18, 21, 33-40
@@ -156,7 +156,6 @@ const int volt_pin = 1;         //pin for measure battery voltage (GPIO 1 - ADC 
 //------LED definitions--------
 const int NUMPIXELST = 10; //number of leds in the top strip
 const int NUMPIXELSB = 8; //number of leds in the bottom strip
-#define RMT_CHANNEL_MAX 1 //limits rmt channels to use
 // DotStar strips using software SPI (faster than NeoPixel, uses SPI protocol)
 Adafruit_DotStar top_strip(NUMPIXELST, top_led_mosi, top_led_sck, DOTSTAR_BGR);
 Adafruit_DotStar bottom_strip(NUMPIXELSB, bottom_led_mosi, bottom_led_sck, DOTSTAR_BGR);
@@ -220,14 +219,13 @@ unsigned long long startime; //variable to store the time in microseconds that t
 bool startimeset = false;
 bool off_set = false;
 bool reversed = false;  //used for reverse spin direction
-unsigned long long motorLsent = 0; //motor send timers
-unsigned long long motorRsent = 1; //offsets it slightly from other motor
-bool motorRsend = true;  //used to switch motor gets updated
 unsigned long loopstart = 0; //stores last gforce read time
 int motorL;
 int motorR;
 int spinspeed;
-bool motorLsend = true;
+unsigned long long motorRsent = 0; //timestamp of last right motor command
+unsigned long long motorLsent = 0; //timestamp of last left motor command
+bool motorRsend = false; //alternation flag for motor sending
 //--------reciever----------
 unsigned long chanstart = 0; //stores last RX read time
 int pwm[NUM_CHANNELS + 1]; //list values from 1000-2000 (indexed 1-6)
@@ -646,7 +644,6 @@ void updateLED()
 void update_motors()
 {
   // Safety clamp: prevent values outside valid DShot 3D range (-999 to 999)
-  // This catches any calculation errors or race conditions
   if (motorL > 999) motorL = 999;
   if (motorL < -999) motorL = -999;
   if (motorR > 999) motorR = 999;
@@ -943,11 +940,11 @@ void wifi_mode()   //turns on wifi mode to connect wirelessly
   Serial.println("=== EXITING WIFI MODE ===");
   WiFi.softAPdisconnect(false);  //turn off wifi
   delay(500);
-  for (int i = 0; i < 2500; i++) //initiate motors
+  for (int i = 0; i < 2500; i++)
   {
-    escR.writeData(0,true);
+    escR.sendMotorStop();
     delayMicroseconds(400);
-    escL.writeData(0,true);
+    escL.sendMotorStop();
     delayMicroseconds(400);
   }
   // Explicitly reset motor values to 0 after re-arming
@@ -1212,23 +1209,26 @@ void setup()
   ArduinoOTA.setHostname("esp32-ap"); //wifi ota config
   ArduinoOTA.setPassword("admin"); //enter this if window opens in arduino IDE asking for pswrd
   
-  Serial.println("Installing ESC drivers...");
-  escR.install(escR_gpio, RMT_CHANNEL_3); //associates pins and RMT channels to esc objects
-  escL.install(escL_gpio, RMT_CHANNEL_2);
+  // DShotRMT per dshot300 example: begin(mode), throttle 48–2047 via sendThrottleValue
+  Serial.println("Installing ESC drivers (DShotRMT DSHOT300)...");
+  escR.begin(DSHOT600);
+  escL.begin(DSHOT600);
 
   Serial.println("Arming ESCs...");
-  for (int i = 0; i < 2500; i++) //arm esc's
+  for (int i = 0; i < 2500; i++)
   {
-    escR.writeData(0,true);
+    escR.sendMotorStop();
     delayMicroseconds(400);
-    escL.writeData(0,true);
+    escL.sendMotorStop();
     delayMicroseconds(400);
   }
-  escR.setReversed(false);
-	escR.set3DMode(true);
+  escR.sendCommand(DSHOT_CMD_SPIN_DIRECTION_NORMAL, 10);
   delayMicroseconds(200);
-	escL.setReversed(false);
-	escL.set3DMode(true);
+  escR.sendCommand(DSHOT_CMD_3D_MODE_ON, 10);
+  delayMicroseconds(200);
+  escL.sendCommand(DSHOT_CMD_SPIN_DIRECTION_NORMAL, 10);
+  delayMicroseconds(200);
+  escL.sendCommand(DSHOT_CMD_3D_MODE_ON, 10);
 
   Serial.println("Starting watchdog...");
   esp_task_wdt_init(WDT_TIMEOUT, true);  // Enable panic so ESP32 restarts, esp_task_wdt_reset(); feeds watchdog
