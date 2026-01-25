@@ -165,15 +165,18 @@ const int animSpeed = 100;   // ms between LED updates when in animation mode
 // ESP32-S2 Mini safe pins
 #define CRSF_RX_PIN 5   // ESP32 RX <- Receiver TX (GPIO 5 - safe)
 #define CRSF_TX_PIN 6   // ESP32 TX -> Receiver RX (GPIO 6 - safe)
-CRSFforArduino crsf = CRSFforArduino(&Serial1, CRSF_RX_PIN, CRSF_TX_PIN);
+CRSFforArduino *crsf = nullptr;
 const int NUM_CHANNELS = 8; //number of reciever channels to use
-static uint32_t lastCrsfPacket = 0; // For failsafe detection
 
 // Non-blocking CRSF using FreeRTOS task (declared after NUM_CHANNELS)
 static volatile uint16_t crsf_channels[NUM_CHANNELS + 1] = {0};  // Shared channel data (indexed 1-NUM_CHANNELS)
+static volatile bool crsf_failsafe = true;  // Failsafe status from CRSF library
 static volatile unsigned long last_crsf_update = 0;  // Timestamp of last CRSF update (microseconds)
 static TaskHandle_t crsf_task_handle = NULL;
 static bool crsf_task_initialized = false;
+
+// CRSF callback function prototype
+void onReceiveRcChannels(serialReceiverLayer::rcChannels_t *rcChannels);
 
 // Non-blocking LED using FreeRTOS task
 static volatile int led_angle_shared = 0;  // Current angle (0-359)
@@ -266,6 +269,7 @@ void translate();
 // RC_Handler.ino
 void update_channels();
 void crsf_read_task(void *pvParameters);
+void onReceiveRcChannels(serialReceiverLayer::rcChannels_t *rcChannels);
 
 // Wifi_Handler.ino
 void wifi_mode();
@@ -828,22 +832,37 @@ void translate()
 }
 
 //=============RC HANDLER FUNCTIONS==================
-// FreeRTOS task to read CRSF channels in background (non-blocking)
+// CRSF callback function - called by library when new RC channels are received
+void onReceiveRcChannels(serialReceiverLayer::rcChannels_t *rcChannels)
+{
+  if (rcChannels->failsafe == false && crsf != nullptr)
+  {
+    // Read all channels and store in shared volatile array
+    for (int channel = 1; channel <= NUM_CHANNELS; channel++) {
+      uint16_t crsfVal = crsf->rcToUs(crsf->getChannel(channel));
+      crsf_channels[channel] = crsfVal;
+    }
+    
+    // Update failsafe status and timestamp (atomic writes)
+    crsf_failsafe = false;
+    last_crsf_update = esp_timer_get_time();
+  }
+  else
+  {
+    // Failsafe active - set failsafe flag
+    crsf_failsafe = true;
+  }
+}
+
+// FreeRTOS task to update CRSF library in background (non-blocking)
 void crsf_read_task(void *pvParameters) {
   Serial.println("  [CRSF Task] Started");
   
   while (1) {
-    // Update CRSF library (reads serial data)
-    crsf.update();
-    
-    // Read all channels and store in shared volatile array
-    for (int channel = 1; channel <= NUM_CHANNELS; channel++) {
-      uint16_t crsfVal = crsf.rcToUs(crsf.getChannel(channel));
-      crsf_channels[channel] = crsfVal;
+    // Update CRSF library (reads serial data, triggers callback)
+    if (crsf != nullptr) {
+      crsf->update();
     }
-    
-    // Update timestamp (atomic write - unsigned long is 32-bit, safe on ESP32)
-    last_crsf_update = esp_timer_get_time();
     
     // Delay 5ms (200Hz update rate - sufficient for human reaction time)
     vTaskDelay(pdMS_TO_TICKS(5));
@@ -853,37 +872,29 @@ void crsf_read_task(void *pvParameters) {
 void update_channels()
 {
   // Fast data copy from shared volatile variables (non-blocking)
-  // CRSF reading happens in background task every 5ms
+  // CRSF reading happens via callback in background task
   
-  // Copy channel data from background task (atomic reads)
-  bool gotNewData = false;
+  // Copy channel data from background callback (atomic reads)
   for (int channel = 1; channel <= NUM_CHANNELS; channel++) {
     uint16_t crsfVal = crsf_channels[channel];  // Atomic read
-    if (crsfVal > 0) {
-      gotNewData = true;
-    }
     pwm[channel] = crsfVal;
     duty[channel] = map(crsfVal, 1000, 2000, 0, 100);
   }
   
-  // Failsafe detection - check if we're receiving valid data
-  unsigned long now_us = esp_timer_get_time();
-  unsigned long last_update_us = last_crsf_update;  // Atomic read
+  // Use failsafe status from CRSF library callback
+  bool current_failsafe = crsf_failsafe;  // Atomic read
   
-  if (gotNewData && pwm[1] > 900) {
+  if (!current_failsafe && pwm[1] > 900) {
     rc_status = true;
-    lastCrsfPacket = now_us / 1000;  // Convert to milliseconds for compatibility
   } else {
-    // Check timeout (500ms = 500000 microseconds)
-    if (last_update_us > 0 && (now_us - last_update_us) > 500000) {
-      duty[1] = 50;
-      duty[2] = 50;
-      duty[3] = 0;
-      duty[4] = 50;
-      duty[5] = 100;
-      duty[6] = 0;
-      rc_status = false;
-    }
+    // Failsafe active - set safe channel values
+    duty[1] = 50;
+    duty[2] = 50;
+    duty[3] = 0;
+    duty[4] = 50;
+    duty[5] = 100;
+    duty[6] = 0;
+    rc_status = false;
   }
 }
 
@@ -1156,11 +1167,25 @@ void setup()
   Serial.print("  CRSF TX Pin: GPIO ");
   Serial.println(CRSF_TX_PIN);
   
-  // Let CRSF library handle Serial1 configuration
-  if (!crsf.begin()) {
+  // Configure Serial1 with custom pins for ESP32-S2
+  Serial1.begin(420000, SERIAL_8N1, CRSF_RX_PIN, CRSF_TX_PIN);
+  
+  // Initialize CRSF for Arduino (pointer-based, like example)
+  crsf = new CRSFforArduino();
+  if (!crsf->begin()) {
+    crsf->end();
+    delete crsf;
+    crsf = nullptr;
+    
     Serial.println("ERROR: CRSF initialization failed!");
+    while (1) {
+      delay(10);
+    }
   } else {
     Serial.println("CRSF initialized successfully.");
+    
+    // Set callback for RC channels (like example)
+    crsf->setRcChannelsCallback(onReceiveRcChannels);
     
     // Start background CRSF read task (non-blocking, updates every 5ms)
     xTaskCreate(
