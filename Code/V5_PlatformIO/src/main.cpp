@@ -25,7 +25,7 @@
 //------accelerometer config------------
 #define ACCEL_MAX_SCALE 400  // 400g range
 #define ACCEL_I2C_ADDRESS 0x18 //0x18 for adafruit accel, 0x19 for sparkfun
-const int accradius = 15; //radius where the g force sensor is located in millimeters
+const int accradius = 18; //radius where the g force sensor is located in millimeters
 
 // LIS331 register addresses
 #define CTRL_REG1    0x20
@@ -909,6 +909,9 @@ void wifi_mode()   //turns on wifi mode to connect wirelessly
   motorR = 0;
   failsafe();
   esp_task_wdt_init(WDT_TIMEOUT, false);  // disable watchdog
+  
+  // Enable WiFi (was disabled in setup() to prevent background tasks)
+  WiFi.mode(WIFI_AP);
   WiFi.softAP(ssid, password);
   Serial.println("=== WIFI/KILL MODE ACTIVE ===");
   Serial.println("Motors stopped. Flip CH5 OFF to resume.");
@@ -950,6 +953,7 @@ void wifi_mode()   //turns on wifi mode to connect wirelessly
   }
   Serial.println("=== EXITING WIFI MODE ===");
   WiFi.softAPdisconnect(false);  //turn off wifi
+  WiFi.mode(WIFI_OFF);  // Explicitly disable WiFi to stop all background tasks
   delay(500);
   for (int i = 0; i < 2500; i++)
   {
@@ -1230,9 +1234,14 @@ void setup()
   LEDStatus = "export";
   delay(2000);
   
+  // Disable WiFi by default to prevent background tasks from running
+  // WiFi will only be enabled when explicitly entering wifi_mode()
+  WiFi.mode(WIFI_OFF);
+  
   Serial.println("Configuring OTA...");
   ArduinoOTA.setHostname("esp32-ap"); //wifi ota config
   ArduinoOTA.setPassword("admin"); //enter this if window opens in arduino IDE asking for pswrd
+  // Note: ArduinoOTA.begin() is only called in wifi_mode(), so OTA is not active by default
   
   // DShotRMT per dshot300 example: begin(mode), throttle 48–2047 via sendThrottleValue
   Serial.println("Installing ESC drivers (DShotRMT DSHOT300)...");
@@ -1391,6 +1400,8 @@ void loop()
   loop_time_sum_us += loopTime_us;
   
   // Debug output at 5Hz only: loop min/avg/max Hz, last us, channel inputs, L/R, G
+  // COMMENTED OUT: Serial prints disabled for performance
+  /*
   unsigned long long now_us = esp_timer_get_time();
   if ((now_us - last_debug_print_us) >= DEBUG_PRINT_INTERVAL_US) {
     last_debug_print_us = now_us;
@@ -1421,6 +1432,7 @@ void loop()
     Serial.println();
     loop_time_count = 0;  // reset for next window
   }
+  */
   
   esp_task_wdt_reset();
 }
