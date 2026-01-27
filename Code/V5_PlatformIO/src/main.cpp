@@ -20,7 +20,7 @@
 #include <ArduinoOTA.h>
 #include <TelnetStream.h>
 #include <EEPROM.h>
-#include <DShotRMT.h>
+#include "DShotESC.h"
 
 //------accelerometer config------------
 #define ACCEL_MAX_SCALE 400  // 400g range
@@ -122,12 +122,11 @@ void i2c_read_task(void *pvParameters) {
 }
 
 //-------ESC config (ESP32-S2 Mini)--------
-// DShotRMT (dshot300 pattern): GPIO + RMT channel, begin(DSHOT300), sendThrottleValue(48–2047)
-// We use sendThrottle3D(-999..999) -> 48–2047; sendMotorStop() = 0 for arm; sendCommand for 3D/reverse.
+// DShotESC: install(gpio, rmtChannel, frequency, divider), sendThrottle3D(-999..999)
 #define escR_gpio GPIO_NUM_3  // right ESC pin (safe)
 #define escL_gpio GPIO_NUM_4  // left ESC pin (safe)
-DShotRMT escR(escR_gpio, RMT_CHANNEL_3);
-DShotRMT escL(escL_gpio, RMT_CHANNEL_2);
+DShotESC escR;  // right ESC object
+DShotESC escL;  // left ESC object
 
 //---------Pin assignments (ESP32-S2 Mini)----------
 // Available GPIOs: 1-18, 21, 33-40
@@ -957,9 +956,9 @@ void wifi_mode()   //turns on wifi mode to connect wirelessly
   delay(500);
   for (int i = 0; i < 2500; i++)
   {
-    escR.sendMotorStop();
+    escR.writeData(0, true);
     delayMicroseconds(400);
-    escL.sendMotorStop();
+    escL.writeData(0, true);
     delayMicroseconds(400);
   }
   // Explicitly reset motor values to 0 after re-arming
@@ -1243,26 +1242,24 @@ void setup()
   ArduinoOTA.setPassword("admin"); //enter this if window opens in arduino IDE asking for pswrd
   // Note: ArduinoOTA.begin() is only called in wifi_mode(), so OTA is not active by default
   
-  // DShotRMT per dshot300 example: begin(mode), throttle 48–2047 via sendThrottleValue
-  Serial.println("Installing ESC drivers (DShotRMT DSHOT300)...");
-  escR.begin(DSHOT600);
-  escL.begin(DSHOT600);
+  // DShotESC: install(gpio, rmtChannel, frequency, divider) - 600kHz = DSHOT600
+  Serial.println("Installing ESC drivers (DShotESC 600kHz)...");
+  escR.install(escR_gpio, RMT_CHANNEL_3, 600000UL, 3);
+  escL.install(escL_gpio, RMT_CHANNEL_2, 600000UL, 3);
 
   Serial.println("Arming ESCs...");
-  for (int i = 0; i < 2500; i++)
+  for (int i = 0; i < 2500; i++) //arm esc's
   {
-    escR.sendMotorStop();
+    escR.writeData(0, true);
     delayMicroseconds(400);
-    escL.sendMotorStop();
+    escL.writeData(0, true);
     delayMicroseconds(400);
   }
-  escR.sendCommand(DSHOT_CMD_SPIN_DIRECTION_NORMAL, 10);
+  escR.setReversed(false);
+  escR.set3DMode(true);
   delayMicroseconds(200);
-  escR.sendCommand(DSHOT_CMD_3D_MODE_ON, 10);
-  delayMicroseconds(200);
-  escL.sendCommand(DSHOT_CMD_SPIN_DIRECTION_NORMAL, 10);
-  delayMicroseconds(200);
-  escL.sendCommand(DSHOT_CMD_3D_MODE_ON, 10);
+  escL.setReversed(false);
+  escL.set3DMode(true);
 
   Serial.println("Starting watchdog...");
   esp_task_wdt_init(WDT_TIMEOUT, true);  // Enable panic so ESP32 restarts, esp_task_wdt_reset(); feeds watchdog
