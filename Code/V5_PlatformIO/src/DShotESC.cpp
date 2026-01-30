@@ -252,7 +252,6 @@ uint8_t DShotESC::checksum(uint16_t data)
 esp_err_t DShotESC::writeData(uint16_t data, bool wait)
 {
 	DSHOT_ERROR_CHECK(rmt_wait_tx_done(_rmtChannel, 0));
-
 	setData(data);
 
 	return rmt_write_items(_rmtChannel,
