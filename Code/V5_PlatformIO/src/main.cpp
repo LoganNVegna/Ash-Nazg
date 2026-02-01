@@ -141,8 +141,6 @@ void accel_spi_read_task(void *pvParameters) {
   
   while (1) {
     int64_t t0 = esp_timer_get_time();
-    // Read accelerometer every 20ms - read each register individually (like SparkFun library)
-    // This is more reliable than auto-increment on some boards
     accel_spi_read_xyz(xyz);
     int16_t y = xyz[1] >> 4;  // 12-bit left-justified, Y axis
     float gforce = (float)ACCEL_MAX_SCALE * (float)y / 2047.0f;
@@ -153,7 +151,7 @@ void accel_spi_read_task(void *pvParameters) {
     
     int64_t t1 = esp_timer_get_time();
     prof_record(PROF_I2C, (uint32_t)(t1 - t0));
-    vTaskDelay(pdMS_TO_TICKS(20));  // Read every 20ms
+    vTaskDelay(pdMS_TO_TICKS(1));  // Read every 1ms = 1kHz (SPI is fast enough)
   }
 }
 
