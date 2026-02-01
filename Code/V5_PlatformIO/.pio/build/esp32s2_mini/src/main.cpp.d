@@ -174,12 +174,10 @@
  C:/Users/lvegn/.platformio/packages/framework-arduinoespressif32/cores/esp32/io_pin_remap.h \
  C:/Users/lvegn/.platformio/packages/framework-arduinoespressif32/cores/esp32/Arduino.h \
  C:/Users/lvegn/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32s2/include/esp_system/include/esp_task_wdt.h \
- C:/Users/lvegn/.platformio/packages/framework-arduinoespressif32/libraries/Wire/src/Wire.h \
- C:/Users/lvegn/.platformio/packages/framework-arduinoespressif32/cores/esp32/esp32-hal.h \
- .pio/libdeps/esp32s2_mini/Adafruit\ DotStar/Adafruit_DotStar.h \
- .pio/libdeps/esp32s2_mini/Adafruit\ BusIO/Adafruit_SPIDevice.h \
  C:/Users/lvegn/.platformio/packages/framework-arduinoespressif32/libraries/SPI/src/SPI.h \
  C:/Users/lvegn/.platformio/packages/framework-arduinoespressif32/cores/esp32/esp32-hal-spi.h \
+ .pio/libdeps/esp32s2_mini/Adafruit\ DotStar/Adafruit_DotStar.h \
+ .pio/libdeps/esp32s2_mini/Adafruit\ BusIO/Adafruit_SPIDevice.h \
  .pio/libdeps/esp32s2_mini/CRSFforArduino/src/CRSFforArduino.hpp \
  .pio/libdeps/esp32s2_mini/CRSFforArduino/src/SerialReceiver/SerialReceiver.hpp \
  .pio/libdeps/esp32s2_mini/CRSFforArduino/src/SerialReceiver/../CFA_Config.hpp \

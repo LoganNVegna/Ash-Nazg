@@ -7,12 +7,11 @@
 
 #include <Arduino.h>
 #include <esp_task_wdt.h>
-#include <Wire.h>
+#include <SPI.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
 #include <Adafruit_DotStar.h>
-#include <SPI.h>
 #include <string.h>  // For strncpy, strcmp
 #include <CRSFforArduino.hpp>
 #include <WiFi.h>
@@ -21,11 +20,73 @@
 #include <TelnetStream.h>
 #include <EEPROM.h>
 #include "DShotESC.h"
+#include <esp_timer.h>
 
-//------accelerometer config------------
+//------ Task CPU-time profiling (per-iteration, excludes vTaskDelay) ------
+enum { PROF_LOOP = 0, PROF_I2C, PROF_CRSF, PROF_LED, PROF_ESC, PROF_N };
+struct task_prof_s {
+  const char *name;
+  volatile uint32_t last_us;
+  volatile uint32_t max_us;
+  volatile uint64_t sum_us;
+  volatile uint32_t count;
+};
+static struct task_prof_s task_profs[PROF_N] = {
+  { "Loop", 0, 0, 0, 0 },
+  { "Accel", 0, 0, 0, 0 },
+  { "CRSF", 0, 0, 0, 0 },
+  { "LED",  0, 0, 0, 0 },
+  { "ESC",  0, 0, 0, 0 },
+};
+static void prof_record(int id, uint32_t dt_us) {
+  if (id < 0 || id >= PROF_N) return;
+  struct task_prof_s *p = &task_profs[id];
+  p->last_us = dt_us;
+  if (dt_us > p->max_us) p->max_us = dt_us;
+  p->sum_us += dt_us;
+  p->count++;
+}
+#define PROF_REPORT_INTERVAL_US  500000   // 500 ms = 2 Hz
+static unsigned long long last_prof_report_us = 0;
+static void prof_report(void) {
+  unsigned long long now = (unsigned long long)esp_timer_get_time();
+  if ((now - last_prof_report_us) < PROF_REPORT_INTERVAL_US) return;
+  last_prof_report_us = now;
+  Serial.println();
+  Serial.println("=== Task CPU-time profile (us, last 500ms window) ===");
+  for (int i = 0; i < PROF_N; i++) {
+    struct task_prof_s *p = &task_profs[i];
+    uint32_t la = p->last_us, mx = p->max_us, n = p->count;
+    uint64_t s = p->sum_us;
+    unsigned long avg = (n > 0) ? (unsigned long)(s / n) : 0;
+    Serial.print("  ");
+    Serial.print(p->name);
+    Serial.print(": last=");
+    Serial.print(la);
+    Serial.print(" max=");
+    Serial.print(mx);
+    Serial.print(" avg=");
+    Serial.print(avg);
+    Serial.print(" count=");
+    Serial.println(n);
+    // Reset for next window
+    p->max_us = 0;
+    p->sum_us = 0;
+    p->count = 0;
+  }
+  Serial.println("=====================================================");
+}
+
+//------accelerometer config (SPI - faster than I2C)------------
 #define ACCEL_MAX_SCALE 400  // 400g range
-#define ACCEL_I2C_ADDRESS 0x18 //0x18 for adafruit accel, 0x19 for sparkfun
 const int accradius = 18; //radius where the g force sensor is located in millimeters
+
+// LIS331 SPI pins (keep GPIO 7,8 from I2C; add 9,10 for MISO, CS)
+#define ACCEL_SCK_PIN  7   // was I2C SCL - SPI clock
+#define ACCEL_MOSI_PIN 8   // was I2C SDA - SPI MOSI (data to accel)
+#define ACCEL_MISO_PIN 9   // NEW - SPI MISO (data from accel)
+#define ACCEL_CS_PIN   10  // NEW - Chip select
+#define ACCEL_SPI_SPEED_HZ  1000000  // 1 MHz
 
 // LIS331 register addresses
 #define CTRL_REG1    0x20
@@ -38,85 +99,60 @@ const int accradius = 18; //radius where the g force sensor is located in millim
 #define OUT_Z_L      0x2C
 #define OUT_Z_H      0x2D
 
-// Non-blocking I2C using FreeRTOS task
-static QueueHandle_t i2c_result_queue = NULL;
-static TaskHandle_t i2c_task_handle = NULL;
+// Non-blocking SPI accel using FreeRTOS task
+static TaskHandle_t accel_task_handle = NULL;
 static float latest_gforce = 0.0;
-static bool i2c_initialized = false;
-static unsigned long last_i2c_update_time = 0;  // Track when I2C task last updated
+static bool accel_initialized = false;
+static unsigned long last_accel_update_time = 0;
 
-// FreeRTOS task to read accelerometer in background
-void i2c_read_task(void *pvParameters) {
-  uint8_t buf[6];
-  
-  Serial.println("  [I2C Task] Started");
+// LIS331 SPI: write one register
+static void accel_spi_write(uint8_t reg, uint8_t val) {
+  SPI.beginTransaction(SPISettings(ACCEL_SPI_SPEED_HZ, MSBFIRST, SPI_MODE0));
+  digitalWrite(ACCEL_CS_PIN, LOW);
+  SPI.transfer(reg & 0x7F);  // write: bit7=0
+  SPI.transfer(val);
+  digitalWrite(ACCEL_CS_PIN, HIGH);
+  SPI.endTransaction();
+}
+
+// LIS331 SPI: read 6 bytes from OUT_X_L with auto-increment
+// Per datasheet: chip drives SDO at start of bit 8, so first byte received is dummy
+static void accel_spi_read_xyz(int16_t *buf) {
+  SPI.beginTransaction(SPISettings(ACCEL_SPI_SPEED_HZ, MSBFIRST, SPI_MODE0));
+  digitalWrite(ACCEL_CS_PIN, LOW);
+  (void)SPI.transfer(0xC0 | (OUT_X_L & 0x3F));  // Send read cmd; first byte received is dummy
+  uint8_t xl = SPI.transfer(0xFF);
+  uint8_t xh = SPI.transfer(0xFF);
+  uint8_t yl = SPI.transfer(0xFF);
+  uint8_t yh = SPI.transfer(0xFF);
+  uint8_t zl = SPI.transfer(0xFF);
+  uint8_t zh = SPI.transfer(0xFF);
+  digitalWrite(ACCEL_CS_PIN, HIGH);
+  SPI.endTransaction();
+  buf[0] = (int16_t)(xl | (xh << 8));
+  buf[1] = (int16_t)(yl | (yh << 8));
+  buf[2] = (int16_t)(zl | (zh << 8));
+}
+
+// FreeRTOS task to read accelerometer via SPI in background
+void accel_spi_read_task(void *pvParameters) {
+  int16_t xyz[3];
+  Serial.println("  [Accel SPI Task] Started");
   
   while (1) {
+    int64_t t0 = esp_timer_get_time();
     // Read accelerometer every 20ms - read each register individually (like SparkFun library)
     // This is more reliable than auto-increment on some boards
-    buf[0] = 0; buf[1] = 0; buf[2] = 0; buf[3] = 0; buf[4] = 0; buf[5] = 0;  // Clear buffer
-    
-    Wire.beginTransmission(ACCEL_I2C_ADDRESS);
-    Wire.write(OUT_X_L);
-    uint8_t error = Wire.endTransmission();
-    if (error == 0) {
-      uint8_t bytes_read = Wire.requestFrom(ACCEL_I2C_ADDRESS, 1);
-      if (bytes_read == 1 && Wire.available()) buf[0] = Wire.read();
-    }
-    
-    Wire.beginTransmission(ACCEL_I2C_ADDRESS);
-    Wire.write(OUT_X_H);
-    error = Wire.endTransmission();
-    if (error == 0) {
-      uint8_t bytes_read = Wire.requestFrom(ACCEL_I2C_ADDRESS, 1);
-      if (bytes_read == 1 && Wire.available()) buf[1] = Wire.read();
-    }
-    
-    Wire.beginTransmission(ACCEL_I2C_ADDRESS);
-    Wire.write(OUT_Y_L);
-    error = Wire.endTransmission();
-    if (error == 0) {
-      uint8_t bytes_read = Wire.requestFrom(ACCEL_I2C_ADDRESS, 1);
-      if (bytes_read == 1 && Wire.available()) buf[2] = Wire.read();
-    }
-    
-    Wire.beginTransmission(ACCEL_I2C_ADDRESS);
-    Wire.write(OUT_Y_H);
-    error = Wire.endTransmission();
-    if (error == 0) {
-      uint8_t bytes_read = Wire.requestFrom(ACCEL_I2C_ADDRESS, 1);
-      if (bytes_read == 1 && Wire.available()) buf[3] = Wire.read();
-    }
-    
-    Wire.beginTransmission(ACCEL_I2C_ADDRESS);
-    Wire.write(OUT_Z_L);
-    error = Wire.endTransmission();
-    if (error == 0) {
-      uint8_t bytes_read = Wire.requestFrom(ACCEL_I2C_ADDRESS, 1);
-      if (bytes_read == 1 && Wire.available()) buf[4] = Wire.read();
-    }
-    
-    Wire.beginTransmission(ACCEL_I2C_ADDRESS);
-    Wire.write(OUT_Z_H);
-    error = Wire.endTransmission();
-    if (error == 0) {
-      uint8_t bytes_read = Wire.requestFrom(ACCEL_I2C_ADDRESS, 1);
-      if (bytes_read == 1 && Wire.available()) buf[5] = Wire.read();
-    }
-    
-    // Parse Y axis (bytes 2 and 3)
-    int16_t y_raw = (int16_t)(buf[2] | (buf[3] << 8));
-    int16_t y = y_raw >> 4;  // 12-bit left-justified
+    accel_spi_read_xyz(xyz);
+    int16_t y = xyz[1] >> 4;  // 12-bit left-justified, Y axis
     float gforce = (float)ACCEL_MAX_SCALE * (float)y / 2047.0f;
     
     // Store result (atomic write - float is 32-bit, should be safe on ESP32)
     latest_gforce = gforce;
-    last_i2c_update_time = esp_timer_get_time();  // Track update time
+    last_accel_update_time = esp_timer_get_time();
     
-    // Notify main loop (optional - we can just poll latest_gforce)
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    xQueueOverwrite(i2c_result_queue, &gforce);
-    
+    int64_t t1 = esp_timer_get_time();
+    prof_record(PROF_I2C, (uint32_t)(t1 - t0));
     vTaskDelay(pdMS_TO_TICKS(20));  // Read every 20ms
   }
 }
@@ -140,16 +176,19 @@ DShotESC escL;  // left ESC object
 // GPIO 4: escL_gpio (left ESC)
 // GPIO 5: CRSF_RX_PIN (receiver RX)
 // GPIO 6: CRSF_TX_PIN (receiver TX)
-// GPIO 7: I2C_SCL_PIN (I2C clock - accelerometer)
-// GPIO 8: I2C_SDA_PIN (I2C data - accelerometer)
+// GPIO 7: ACCEL_SCK (SPI clock - accelerometer)
+// GPIO 8: ACCEL_MOSI (SPI data to accel)
+// GPIO 9: ACCEL_MISO (SPI data from accel)
+// GPIO 10: ACCEL_CS (accel chip select)
 // GPIO 17: top_led_sck (top LED strip clock)
-// GPIO 18: top_led_mosi (top LED strip data)
-// GPIO 21: bottom_led_mosi (bottom LED strip data)
+// GPIO 21: top_led_mosi (top LED strip data, DI)
+// GPIO 18: bottom_led_mosi (bottom LED strip data, DI)
+// GPIO 2:  bottom_led_sck (bottom LED strip clock)
 //
-const int top_led_mosi = 18;     // Top strip MOSI (data) pin (GPIO 18 - safe)
-const int top_led_sck = 17;      // Top strip SCK (clock) pin (GPIO 17 - safe)
-const int bottom_led_mosi = 21;  // Bottom strip MOSI (data) pin (GPIO 21 - safe)
-const int bottom_led_sck = 2;    // Bottom strip SCK (clock) pin (GPIO 2 - safe, changed from 7 to avoid I2C conflict)
+const int top_led_mosi = 21;     // Top strip DI (data) - GPIO 21
+const int top_led_sck = 17;      // Top strip CI (clock) - GPIO 17
+const int bottom_led_mosi = 18;  // Bottom strip DI (data) - GPIO 18
+const int bottom_led_sck = 2;    // Bottom strip CI (clock) - GPIO 2
 const int volt_pin = 1;         //pin for measure battery voltage (GPIO 1 - ADC capable)
 
 //------LED definitions--------
@@ -164,15 +203,15 @@ const int animSpeed = 100;   // ms between LED updates when in animation mode
 // ESP32-S2 Mini safe pins
 #define CRSF_RX_PIN 5   // ESP32 RX <- Receiver TX (GPIO 5 - safe)
 #define CRSF_TX_PIN 6   // ESP32 TX -> Receiver RX (GPIO 6 - safe)
+#define CRSF_POLL_HZ 200
+#define CRSF_POLL_INTERVAL_MS  (1000 / CRSF_POLL_HZ)  // 5 ms
 CRSFforArduino *crsf = nullptr;
 const int NUM_CHANNELS = 8; //number of reciever channels to use
 
-// Non-blocking CRSF using FreeRTOS task (declared after NUM_CHANNELS)
+// CRSF channel data (callback fills; main loop reads via update_channels)
 static volatile uint16_t crsf_channels[NUM_CHANNELS + 1] = {0};  // Shared channel data (indexed 1-NUM_CHANNELS)
 static volatile bool crsf_failsafe = true;  // Failsafe status from CRSF library
 static volatile unsigned long last_crsf_update = 0;  // Timestamp of last CRSF update (microseconds)
-static TaskHandle_t crsf_task_handle = NULL;
-static bool crsf_task_initialized = false;
 
 // CRSF callback function prototype
 void onReceiveRcChannels(serialReceiverLayer::rcChannels_t *rcChannels);
@@ -267,7 +306,6 @@ void translate();
 
 // RC_Handler.ino
 void update_channels();
-void crsf_read_task(void *pvParameters);
 void onReceiveRcChannels(serialReceiverLayer::rcChannels_t *rcChannels);
 
 // Wifi_Handler.ino
@@ -344,7 +382,7 @@ long long spintimefunct()
 // Non-blocking I2C read - just returns latest value from background task
 // Always returns immediately (non-blocking)
 static bool accel_read_y_nonblocking(float *result) {
-  if (i2c_initialized) {
+  if (accel_initialized) {
     *result = latest_gforce;  // Atomic read (float is 32-bit, safe on ESP32)
     last_gforce_raw = latest_gforce;
     return true;
@@ -355,6 +393,7 @@ static bool accel_read_y_nonblocking(float *result) {
 
 float get_accel_force_g() 
 {
+  if (!accel_initialized) return 0.0f;
   static const int NUM_SAMPLES = 7;  // Reduced from 10 to 7 for faster response (still smooth)
   static float samples[NUM_SAMPLES];
   static int index = 0;
@@ -368,7 +407,7 @@ float get_accel_force_g()
   
   // Update rolling average every 20ms (background task reads every 20ms)
   // Use cached time from last_i2c_update_time if available, otherwise get current time
-  unsigned long now = (last_i2c_update_time > 0) ? last_i2c_update_time : esp_timer_get_time();
+  unsigned long now = (last_accel_update_time > 0) ? last_accel_update_time : esp_timer_get_time();
   if (now - last_update > 20000) {
     last_update = now;
     
@@ -478,6 +517,7 @@ void led_update_task(void *pvParameters) {
   const int ANGLE_PRECISION = 5;  // 5° precision (72 updates per rotation)
   
   while (1) {
+    int64_t t0 = esp_timer_get_time();
     // Read shared variables (atomic reads)
     int current_angle = led_angle_shared;
     int current_rpm = led_rpm_shared;
@@ -614,6 +654,8 @@ void led_update_task(void *pvParameters) {
       last_displayed_angle = current_angle;
     }
     
+    int64_t t1 = esp_timer_get_time();
+    prof_record(PROF_LED, (uint32_t)(t1 - t0));
     // Small delay to yield to other tasks (prevents task from consuming all CPU)
     // Using 0ms delay = yield immediately, check again as fast as possible
     vTaskDelay(pdMS_TO_TICKS(0));
@@ -665,29 +707,25 @@ void update_motors()
   
   // If both are ready, send to the one that was sent longest ago first
   // This ensures fair scheduling and prevents one motor from starving
-  if (right_ready && left_ready) {
-    // Send to the motor that was sent longest ago
-    if ((current_time - motorRsent) >= (current_time - motorLsent)) {
-      // Right motor was sent longer ago, send to it first
+  if (right_ready || left_ready) {
+    int64_t t0 = esp_timer_get_time();
+    if (right_ready && left_ready) {
+      // Send to the motor that was sent longest ago
+      if ((current_time - motorRsent) >= (current_time - motorLsent)) {
+        escR.sendThrottle3D(motorR);
+        motorRsent = current_time;
+      } else {
+        escL.sendThrottle3D(motorL);
+        motorLsent = current_time;
+      }
+    } else if (right_ready) {
       escR.sendThrottle3D(motorR);
       motorRsent = current_time;
     } else {
-      // Left motor was sent longer ago, send to it first
       escL.sendThrottle3D(motorL);
       motorLsent = current_time;
     }
-  } else if (right_ready) {
-    // Only right motor is ready
-    escR.sendThrottle3D(motorR);
-    motorRsent = current_time;
-  } else if (left_ready) {
-    // Only left motor is ready
-    escL.sendThrottle3D(motorL);
-    motorLsent = current_time;
-  }
-  
-  // Update alternation flag for backwards compatibility
-  if (right_ready || left_ready) {
+    prof_record(PROF_ESC, (uint32_t)(esp_timer_get_time() - t0));
     motorRsend = !motorRsend;
   }
 }
@@ -830,50 +868,31 @@ void translate()
   }
 }
 
+// CRSF raw->us scale (same as library rcToUs): (raw * 0.62477120195241) + 881
+#define CRSF_RAW_TO_US(raw)  ((uint16_t)(((raw) * 0.62477120195241F) + 881))
+
 //=============RC HANDLER FUNCTIONS==================
-// CRSF callback function - called by library when new RC channels are received
+// CRSF callback - use rcChannels->value[] directly, convert to us inline (no getChannel/rcToUs per channel)
 void onReceiveRcChannels(serialReceiverLayer::rcChannels_t *rcChannels)
 {
-  if (rcChannels->failsafe == false && crsf != nullptr)
+  if (rcChannels->failsafe == false)
   {
-    // Read all channels and store in shared volatile array
-    for (int channel = 1; channel <= NUM_CHANNELS; channel++) {
-      uint16_t crsfVal = crsf->rcToUs(crsf->getChannel(channel));
-      crsf_channels[channel] = crsfVal;
+    for (int ch = 1; ch <= NUM_CHANNELS; ch++) {
+      uint16_t raw = rcChannels->value[ch - 1];
+      crsf_channels[ch] = CRSF_RAW_TO_US(raw);
     }
-    
-    // Update failsafe status and timestamp (atomic writes)
     crsf_failsafe = false;
     last_crsf_update = esp_timer_get_time();
   }
   else
   {
-    // Failsafe active - set failsafe flag
     crsf_failsafe = true;
-  }
-}
-
-// FreeRTOS task to update CRSF library in background (non-blocking)
-void crsf_read_task(void *pvParameters) {
-  Serial.println("  [CRSF Task] Started");
-  
-  while (1) {
-    // Update CRSF library (reads serial data, triggers callback)
-    if (crsf != nullptr) {
-      crsf->update();
-    }
-    
-    // Delay 5ms (200Hz update rate - sufficient for human reaction time)
-    vTaskDelay(pdMS_TO_TICKS(5));
   }
 }
 
 void update_channels()
 {
-  // Fast data copy from shared volatile variables (non-blocking)
-  // CRSF reading happens via callback in background task
-  
-  // Copy channel data from background callback (atomic reads)
+  // Copy channel data from CRSF callback (filled when crsf->update() runs in main loop)
   for (int channel = 1; channel <= NUM_CHANNELS; channel++) {
     uint16_t crsfVal = crsf_channels[channel];  // Atomic read
     pwm[channel] = crsfVal;
@@ -1033,136 +1052,47 @@ void setup()
   Serial.print("Offset loaded: ");
   Serial.println(offset);
   
-  Serial.println("Starting I2C...");
-  #define I2C_SDA_PIN 8   // Safe pin
-  #define I2C_SCL_PIN 7   // Safe pin (bottom_led_sck moved to GPIO 2 to avoid conflict)
-  Serial.print("  SDA=GPIO ");
-  Serial.print(I2C_SDA_PIN);
-  Serial.print(", SCL=GPIO ");
-  Serial.println(I2C_SCL_PIN);
-  
-  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-  Wire.setClock(1000000);  // 1MHz - LIS331 supports up to 1MHz
-  Wire.setTimeOut(1);
-  Serial.println("  I2C initialized");
-  
-  // Initialize loopstart to current time so timing check works
   loopstart = esp_timer_get_time();
   
-  Serial.println("Starting accelerometer...");
+  Serial.println("Starting accelerometer (SPI)...");
+  Serial.print("  SCK=GPIO ");
+  Serial.print(ACCEL_SCK_PIN);
+  Serial.print(", MOSI=GPIO ");
+  Serial.print(ACCEL_MOSI_PIN);
+  Serial.print(", MISO=GPIO ");
+  Serial.print(ACCEL_MISO_PIN);
+  Serial.print(", CS=GPIO ");
+  Serial.println(ACCEL_CS_PIN);
   
-  // Verify device is present
-  Wire.beginTransmission(ACCEL_I2C_ADDRESS);
-  uint8_t error = Wire.endTransmission();
-  if (error != 0) {
-    Serial.print("  ERROR: Accelerometer not found at 0x");
-    Serial.print(ACCEL_I2C_ADDRESS, HEX);
-    Serial.print(" (error: ");
-    Serial.print(error);
-    Serial.println(")");
-  } else {
-    Serial.print("  Device found at 0x");
-    Serial.println(ACCEL_I2C_ADDRESS, HEX);
-  }
+  pinMode(ACCEL_CS_PIN, OUTPUT);
+  digitalWrite(ACCEL_CS_PIN, HIGH);
+  SPI.begin(ACCEL_SCK_PIN, ACCEL_MISO_PIN, ACCEL_MOSI_PIN, ACCEL_CS_PIN);
   
-  // Initialize LIS331: CTRL_REG1 = normal power mode, 400Hz data rate, all axes enabled
-  Wire.beginTransmission(ACCEL_I2C_ADDRESS);
-  Wire.write(CTRL_REG1);
-  Wire.write(0x27);  // Normal mode (0x20), 400Hz (0x18), XYZ enabled (0x07)
-  error = Wire.endTransmission();
-  if (error != 0) {
-    Serial.print("  ERROR: Failed to write CTRL_REG1 (error: ");
-    Serial.print(error);
-    Serial.println(")");
-  }
-  
-  // Verify CTRL_REG1 was written
+  accel_spi_write(CTRL_REG1, 0x27);  // Normal mode, 400Hz, XYZ enabled
   delay(10);
-  Wire.beginTransmission(ACCEL_I2C_ADDRESS);
-  Wire.write(CTRL_REG1);
-  Wire.endTransmission(false);
-  Wire.requestFrom(ACCEL_I2C_ADDRESS, 1);
-  if (Wire.available()) {
-    uint8_t reg1_val = Wire.read();
-    Serial.print("  CTRL_REG1 readback: 0x");
-    Serial.println(reg1_val, HEX);
-    if (reg1_val != 0x27) {
-      Serial.println("  WARNING: CTRL_REG1 value doesn't match!");
-    }
-  }
-  
-  // CTRL_REG4 = high range (400g), little endian, high resolution
-  Wire.beginTransmission(ACCEL_I2C_ADDRESS);
-  Wire.write(CTRL_REG4);
-  Wire.write(0x90);  // High range (0x80), high resolution (0x08), little endian (0x00)
-  error = Wire.endTransmission();
-  if (error != 0) {
-    Serial.print("  ERROR: Failed to write CTRL_REG4 (error: ");
-    Serial.print(error);
-    Serial.println(")");
-  }
-  
-  // Give accelerometer time to start up
+  accel_spi_write(CTRL_REG4, 0x90);  // 400g, high res
   delay(100);
   
-  // Check STATUS_REG to see if data is ready
-  Wire.beginTransmission(ACCEL_I2C_ADDRESS);
-  Wire.write(STATUS_REG);
-  Wire.endTransmission(false);
-  Wire.requestFrom(ACCEL_I2C_ADDRESS, 1);
-  if (Wire.available()) {
-    uint8_t status = Wire.read();
-    Serial.print("  STATUS_REG: 0x");
-    Serial.println(status, HEX);
-    if (status & 0x08) {
-      Serial.println("  Data ready!");
-    } else {
-      Serial.println("  WARNING: Data not ready yet");
-    }
-  }
-  
-  // Try reading data registers to see if they're updating
-  Serial.println("  Testing data read...");
-  for (int i = 0; i < 3; i++) {
-    delay(50);
-    Wire.beginTransmission(ACCEL_I2C_ADDRESS);
-    Wire.write(OUT_X_L);
-    Wire.endTransmission(false);
-    Wire.requestFrom(ACCEL_I2C_ADDRESS, 6);
-    uint8_t test_buf[6];
-    for (int j = 0; j < 6 && Wire.available(); j++) {
-      test_buf[j] = Wire.read();
-    }
-    Serial.print("  Test read ");
-    Serial.print(i+1);
-    Serial.print(": ");
-    for (int j = 0; j < 6; j++) {
-      Serial.print("0x");
-      if (test_buf[j] < 16) Serial.print("0");
-      Serial.print(test_buf[j], HEX);
-      Serial.print(" ");
-    }
-    Serial.println();
-  }
+  int16_t test_xyz[3];
+  accel_spi_read_xyz(test_xyz);
+  Serial.print("  Test read: X=");
+  Serial.print(test_xyz[0]);
+  Serial.print(" Y=");
+  Serial.print(test_xyz[1]);
+  Serial.print(" Z=");
+  Serial.println(test_xyz[2]);
   
   Serial.println("  Accelerometer configured (400g range, 400Hz)");
-  
-  // Create queue for I2C results (though we'll just use latest_gforce directly)
-  i2c_result_queue = xQueueCreate(1, sizeof(float));
-  
-  // Start background I2C read task
-  // ESP32-S2 is single-core, so use xTaskCreate (not pinned to core)
   xTaskCreate(
-    i2c_read_task,      // Task function
-    "I2C_Read",         // Task name
-    2048,               // Stack size
-    NULL,               // Parameters
-    1,                  // Priority (low, so main loop has priority)
-    &i2c_task_handle    // Task handle
+    accel_spi_read_task,
+    "Accel_SPI",
+    2048,
+    NULL,
+    1,
+    &accel_task_handle
   );
-  
-  i2c_initialized = true;
-  Serial.println("  Background I2C read task started (non-blocking)");
+  accel_initialized = true;
+  Serial.println("  Background accel SPI task started");
   
   Serial.println("Starting CRSF receiver...");
   Serial.print("  CRSF RX Pin: GPIO ");
@@ -1189,18 +1119,7 @@ void setup()
     
     // Set callback for RC channels (like example)
     crsf->setRcChannelsCallback(onReceiveRcChannels);
-    
-    // Start background CRSF read task (non-blocking, updates every 5ms)
-    xTaskCreate(
-      crsf_read_task,      // Task function
-      "CRSF_Read",         // Task name
-      2048,                // Stack size
-      NULL,                // Parameters
-      1,                   // Priority (low, so main loop has priority)
-      &crsf_task_handle    // Task handle
-    );
-    crsf_task_initialized = true;
-    Serial.println("  Background CRSF read task started (non-blocking, 200Hz)");
+    Serial.println("  CRSF: polling in main loop (no background task)");
   }
   
   Serial.println("Starting LED strips (DotStar)...");
@@ -1283,6 +1202,12 @@ void loop()
 {
   unsigned long long t0 = esp_timer_get_time();
   
+  // CRSF: poll in main loop (no task) so Serial1 is read every iteration
+  if (crsf != nullptr) {
+    int64_t t_crsf0 = esp_timer_get_time();
+    crsf->update();
+    prof_record(PROF_CRSF, (uint32_t)(esp_timer_get_time() - t_crsf0));
+  }
   update_channels();
   heading_funct();
   heading_adj();
@@ -1290,6 +1215,29 @@ void loop()
   
   if (!rc_status) {
     failsafe();
+    unsigned long long t1 = esp_timer_get_time();
+    prof_record(PROF_LOOP, (uint32_t)(t1 - t0));
+    // prof_report();  // Disabled
+    // Debug output (5Hz) - also when in failsafe
+    static unsigned long long last_failsafe_debug_us = 0;
+    if ((t1 - last_failsafe_debug_us) >= DEBUG_PRINT_INTERVAL_US) {
+      last_failsafe_debug_us = t1;
+      Serial.print("L=");
+      Serial.print(motorL);
+      Serial.print(" R=");
+      Serial.print(motorR);
+      Serial.print(" CH3=");
+      Serial.print(pwm[3]);
+      Serial.print(" G=");
+      Serial.print(last_gforce_raw, 2);
+      // If last_crsf_update is 0, no valid CRSF packet has ever been received (wiring/baud/receiver)
+      Serial.print(" crsf_us=");
+      Serial.print((unsigned long)last_crsf_update);
+      Serial.println(" [failsafe]");
+    }
+    esp_task_wdt_reset();
+    // Yield so CRSF task can run and read Serial1; otherwise main loop starves it at same priority
+    vTaskDelay(pdMS_TO_TICKS(1));
     return;
   }
   
@@ -1396,40 +1344,24 @@ void loop()
   if (loopTime_us > loop_time_max_us) loop_time_max_us = loopTime_us;
   loop_time_sum_us += loopTime_us;
   
-  // Debug output at 5Hz only: loop min/avg/max Hz, last us, channel inputs, L/R, G
-  // COMMENTED OUT: Serial prints disabled for performance
-  /*
+  prof_record(PROF_LOOP, (uint32_t)loopTime_us);
+  // prof_report();  // Disabled - was 2 Hz task CPU-time profile dump
+  
+  // Debug output at 5Hz: motor speeds, channel 3, accelerometer
+  static unsigned long long last_debug_print_us = 0;
   unsigned long long now_us = esp_timer_get_time();
   if ((now_us - last_debug_print_us) >= DEBUG_PRINT_INTERVAL_US) {
     last_debug_print_us = now_us;
-    unsigned long avg_us = (loop_time_count > 0) ? (unsigned long)(loop_time_sum_us / loop_time_count) : 0;
-    float min_hz = (loop_time_max_us > 0) ? (1000000.0f / loop_time_max_us) : 0.0f;  // max us -> min Hz
-    float avg_hz = (avg_us > 0) ? (1000000.0f / avg_us) : 0.0f;
-    float max_hz = (loop_time_min_us > 0) ? (1000000.0f / loop_time_min_us) : 0.0f;  // min us -> max Hz
-    Serial.print("Loop: ");
-    Serial.print((int)min_hz);
-    Serial.print("/");
-    Serial.print((int)avg_hz);
-    Serial.print("/");
-    Serial.print((int)max_hz);
-    Serial.print(" Hz (last ");
-    Serial.print(loopTime_us);
-    Serial.print(" us) | CH1=");
-    Serial.print(pwm[1]);
-    Serial.print(" CH3=");
-    Serial.print(pwm[3]);
-    Serial.print(" CH5=");
-    Serial.print(pwm[5]);
-    Serial.print(" L=");
+    Serial.print("L=");
     Serial.print(motorL);
     Serial.print(" R=");
     Serial.print(motorR);
-    Serial.print(" | G=");
+    Serial.print(" CH3=");
+    Serial.print(pwm[3]);
+    Serial.print(" G=");
     Serial.print(last_gforce_raw, 2);
     Serial.println();
-    loop_time_count = 0;  // reset for next window
   }
-  */
   
   esp_task_wdt_reset();
 }
