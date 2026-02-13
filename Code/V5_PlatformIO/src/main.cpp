@@ -1,8 +1,9 @@
 /**
- * Ash-Nazg Melty Brain Robot - V5 Testing
- * 
- * PlatformIO port of the V5_Testing Arduino sketch
- * For Adafruit QT Py ESP32 Pico with PSRAM
+ * Ash-Nazg Melty Brain Robot - V5
+ *
+ * Adafruit QT Py ESP32-S3 (dual-core).
+ * DShot ESC output runs on Core 1 at fixed 6 kHz for steady timing (4–8 kHz range);
+ * main loop, CRSF, accel, and LEDs run on Core 0.
  */
 
 #include <Arduino.h>
@@ -11,6 +12,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
+#include <freertos/semphr.h>
 #include <Adafruit_DotStar.h>
 #include <string.h>  // For strncpy, strcmp
 #include <CRSFforArduino.hpp>
@@ -81,11 +83,16 @@ static void prof_report(void) {
 #define ACCEL_MAX_SCALE 400  // 400g range
 const int accradius = 18; //radius where the g force sensor is located in millimeters
 
-// LIS331 SPI pins (keep GPIO 7,8 from I2C; add 9,10 for MISO, CS)
-#define ACCEL_SCK_PIN  7   // was I2C SCL - SPI clock
-#define ACCEL_MOSI_PIN 8   // was I2C SDA - SPI MOSI (data to accel)
-#define ACCEL_MISO_PIN 9   // NEW - SPI MISO (data from accel)
-#define ACCEL_CS_PIN   10  // NEW - Chip select
+// LIS331 accelerometer in SPI mode: chip pins are SDA, SCL, SDO, CS.
+// Wire LIS331 -> Qt Py ESP32-S3:
+//   LIS331 SDA (data in)  -> Qt Py GPIO 35  (our MOSI)
+//   LIS331 SCL (clock)    -> Qt Py GPIO 36  (our SCK)
+//   LIS331 SDO (data out) -> Qt Py GPIO 37  (our MISO)
+//   LIS331 CS             -> Qt Py GPIO 8   (our CS)
+#define ACCEL_SCK_PIN  36  // Qt Py SCK  -> LIS331 SCL
+#define ACCEL_MOSI_PIN 35  // Qt Py MOSI -> LIS331 SDA
+#define ACCEL_MISO_PIN 37  // Qt Py MISO -> LIS331 SDO
+#define ACCEL_CS_PIN   8   // Qt Py CS   -> LIS331 CS
 #define ACCEL_SPI_SPEED_HZ  1000000  // 1 MHz
 
 // LIS331 register addresses
@@ -137,7 +144,7 @@ static void accel_spi_read_xyz(int16_t *buf) {
 // FreeRTOS task to read accelerometer via SPI in background
 void accel_spi_read_task(void *pvParameters) {
   int16_t xyz[3];
-  Serial.println("  [Accel SPI Task] Started");
+  Serial.println("  [Accel SPI Task] Started (Core 0)");
   
   while (1) {
     int64_t t0 = esp_timer_get_time();
@@ -155,52 +162,40 @@ void accel_spi_read_task(void *pvParameters) {
   }
 }
 
-//-------ESC config (ESP32-S2 Mini)--------
-// DShotESC: install(gpio, rmtChannel, frequency, divider), sendThrottle3D(-999..999)
-#define escR_gpio GPIO_NUM_3  // right ESC pin (safe)
-#define escL_gpio GPIO_NUM_4  // left ESC pin (safe)
-DShotESC escR;  // right ESC object
-DShotESC escL;  // left ESC object
+//-------ESC config (Qt Py ESP32-S3)--------
+// DShot 600 @ 6 kHz send rate on Core 1 only (no main-loop jitter)
+#define escR_gpio GPIO_NUM_18   // right ESC (left side pin 1)
+#define escL_gpio GPIO_NUM_17   // left ESC (left side pin 2)
+DShotESC escR;
+DShotESC escL;
 
-//---------Pin assignments (ESP32-S2 Mini)----------
-// Available GPIOs: 1-18, 21, 33-40
-// DotStar uses SPI: MOSI (data) and SCK (clock) pins
-// ESP32-S2 Mini safe pins: 1-8, 17, 18, 21
+//---------Pin assignments (Adafruit QT Py ESP32-S3 - your board)----------
+// Left side:  18, 17, 9, 8, 7 (SDA), 6 (SCL), 5 (TX)
+// Right side: 35 (MOSI), 37 (MISO), 36 (SCK), 16 (RX)
 //
-// PIN ASSIGNMENT SUMMARY (verify no conflicts):
-// GPIO 1: volt_pin (battery voltage ADC)
-// GPIO 2: bottom_led_sck (bottom LED strip clock)
-// GPIO 3: escR_gpio (right ESC)
-// GPIO 4: escL_gpio (left ESC)
-// GPIO 5: CRSF_RX_PIN (receiver RX)
-// GPIO 6: CRSF_TX_PIN (receiver TX)
-// GPIO 7: ACCEL_SCK (SPI clock - accelerometer)
-// GPIO 8: ACCEL_MOSI (SPI data to accel)
-// GPIO 9: ACCEL_MISO (SPI data from accel)
-// GPIO 10: ACCEL_CS (accel chip select)
-// GPIO 17: top_led_sck (top LED strip clock)
-// GPIO 21: top_led_mosi (top LED strip data, DI)
-// GPIO 18: bottom_led_mosi (bottom LED strip data, DI)
-// GPIO 2:  bottom_led_sck (bottom LED strip clock)
+// ASSIGNMENTS:
+// GPIO 18:  escR (right ESC)
+// GPIO 17:  escL (left ESC)
+// GPIO 5:   CRSF_TX (UART TX)
+// GPIO 16:  CRSF_RX (UART RX)
+// GPIO 36:  ACCEL SCK  -> LIS331 SCL
+// GPIO 35:  ACCEL MOSI -> LIS331 SDA
+// GPIO 37:  ACCEL MISO -> LIS331 SDO
+// GPIO 8:   ACCEL CS   -> LIS331 CS
+// GPIO 9:   top_led_mosi (DotStar data) - top strip only
+// GPIO 7:   top_led_sck (DotStar clock)
 //
-const int top_led_mosi = 21;     // Top strip DI (data) - GPIO 21
-const int top_led_sck = 17;      // Top strip CI (clock) - GPIO 17
-const int bottom_led_mosi = 18;  // Bottom strip DI (data) - GPIO 18
-const int bottom_led_sck = 2;    // Bottom strip CI (clock) - GPIO 2
-const int volt_pin = 1;         //pin for measure battery voltage (GPIO 1 - ADC capable)
+const int top_led_mosi = 9;
+const int top_led_sck = 7;
 
-//------LED definitions--------
-const int NUMPIXELST = 10; //number of leds in the top strip
-const int NUMPIXELSB = 8; //number of leds in the bottom strip
-// DotStar strips using software SPI (faster than NeoPixel, uses SPI protocol)
-Adafruit_DotStar top_strip(NUMPIXELST, top_led_mosi, top_led_sck, DOTSTAR_BGR);
-Adafruit_DotStar bottom_strip(NUMPIXELSB, bottom_led_mosi, bottom_led_sck, DOTSTAR_BGR);
+//------LED definitions (top strip only)--------
+const int NUMPIXELST = 10; // number of LEDs in the top strip
 const int animSpeed = 100;   // ms between LED updates when in animation mode
+Adafruit_DotStar top_strip(NUMPIXELST, top_led_mosi, top_led_sck, DOTSTAR_BGR);
 
-//------Reciever config (CRSF)-----------
-// ESP32-S2 Mini safe pins
-#define CRSF_RX_PIN 5   // ESP32 RX <- Receiver TX (GPIO 5 - safe)
-#define CRSF_TX_PIN 6   // ESP32 TX -> Receiver RX (GPIO 6 - safe)
+//------Receiver config (CRSF) - Qt Py ESP32-S3: 5=TX, 16=RX --------
+#define CRSF_RX_PIN 16   // ESP32 RX <- Receiver TX (right side)
+#define CRSF_TX_PIN 5    // ESP32 TX -> Receiver RX (left side)
 CRSFforArduino crsf = CRSFforArduino(&Serial1, CRSF_RX_PIN, CRSF_TX_PIN);
 const int NUM_CHANNELS = 8; //number of reciever channels to use
 static uint32_t lastCrsfPacket = 0;  // For failsafe detection
@@ -216,11 +211,21 @@ static volatile int led_angle_shared = 0;  // Current angle (0-359)
 static volatile int led_rpm_shared = 0;   // Current RPM
 static char led_status_shared[32] = "armed";  // LED status string (char array for thread safety)
 static volatile bool led_data_changed = false;  // Flag when status changes
+// Motor-on LED: show at heading+180°, green (accel) to red (decel), brightness by magnitude
+static volatile bool led_motor_on_shared = false;
+static volatile float led_pulse_position_shared = 0.0f;  // 0 = accel, 1 = decel
+static volatile int led_transpeed_shared = 0;  // 0-100 for brightness
 static TaskHandle_t led_task_handle = NULL;
 static bool led_task_initialized = false;
+static SemaphoreHandle_t led_status_mutex = NULL;  // Protects led_status_shared read/write
 
 //------Driving characteristcs------
-const int LEDheading = 315; //degree where the LED heading is centered, adjust for tuning heading vs driving direction
+// Unified "floor diagram" angles: 0° = forward (direction robot moves). rotation_angle() should be
+// calibrated so 0° = forward; then heading LED and motor pulse LED both use this same reference.
+const int LEDheading = 0;
+const int LED_STRIP_OFFSET_DEG = 30;  // LED strip start is this many degrees clockwise from forward (0°)
+const int LED_HEADING_HALF_DEG = 10;  // Heading LED on within ±this of 0°
+const int LED_MOTOR_ARC_HALF_DEG = 27;  // Motor-on LED arc half-width (~15% of 360°)
 const int percentdecel = 15; //percentage of rotation the translation deceleration wave occurs for each motor. Should be <= 50
 const float acc_rate = 0.4; //0.2(least aggressive spinup) - 1.0(most aggressive spinup)
 
@@ -230,7 +235,7 @@ const char *password = "meltybrain"; //wifi password
 // Start TelnetStream: Enter telnet {insert ip address} for me: telnet 192.168.4.1 in CMD to view output
 
 //-----other constants-------
-const int denom = round((1.0 / sqrt(0.00001118*accradius))*3); //calculates denominator ahead of time to reduce unnecessary calculations;
+const int denom = round(1.0 / sqrt(0.00001118*accradius)); //calculates denominator ahead of time to reduce unnecessary calculations;
 const int OFFSET_ADDR = 0;  // EEPROM address to store rpm offset
 const int WDT_TIMEOUT = 5;  // seconds
 
@@ -256,12 +261,13 @@ bool startimeset = false;
 bool off_set = false;
 bool reversed = false;  //used for reverse spin direction
 unsigned long loopstart = 0; //stores last gforce read time
-int motorL;
-int motorR;
+// DShot task on Core 1 reads these; main loop (Core 0) writes. 32-bit aligned = atomic.
+volatile int motorL;
+volatile int motorR;
 int spinspeed;
-unsigned long long motorRsent = 0; //timestamp of last right motor command
-unsigned long long motorLsent = 0; //timestamp of last left motor command
-bool motorRsend = false; //alternation flag for motor sending
+static TaskHandle_t dshot_task_handle = NULL;
+#define DSHOT_SEND_HZ       6000   // 6 kHz
+#define DSHOT_PERIOD_US      (1000000 / DSHOT_SEND_HZ)
 //--------reciever----------
 unsigned long chanstart = 0; //stores last RX read time
 int pwm[NUM_CHANNELS + 1]; //list values from 1000-2000 (indexed 1-6)
@@ -271,8 +277,6 @@ int rec_gap;
 int rec_last;
 bool rc_status = false; //whether getting rc signal, used for triggering failsafe
 //----------other----------
-float volts; //variable to store current battery voltage
-int batloop; //variable for tracking battery update loop
 long loop_time;
 long loop_start;
 bool motor_on = false;
@@ -295,9 +299,10 @@ void updateLED();
 void led_update_task(void *pvParameters);
 
 // Motor_Control.ino
-void update_motors();
+void update_motors();   // no-op; DShot task on Core 1 does all ESC output
 void spin();
 void translate();
+void dshot_task(void *pvParameters);  // runs on Core 1 at DSHOT_SEND_HZ
 
 // RC_Handler.ino
 void update_channels();
@@ -308,7 +313,6 @@ void wifi_mode();
 void data_export();
 
 // Main functions
-void get_battery();
 void failsafe();
 
 static float last_gforce_raw = 0.0;
@@ -426,17 +430,22 @@ float get_accel_force_g()
 
 int rotation_angle()
 {
-  unsigned long long currentime;
-  unsigned long long spintime;
-  spintime = spintimefunct();
-  currentime = esp_timer_get_time();
-  //angle = ((currentime - ((irVisibleEnd + irVisibleStart) / 2) ) / spintime) * 360;
-  angle = ((double)(currentime - previoustime) / (double)spintime) * 360.0;
-  if((currentime - previoustime) >= spintime)  //resets timer every revolution
-  {
-    previoustime = currentime + (spintime - (currentime - previoustime));
+  unsigned long long currentime = esp_timer_get_time();
+  long long spintime = spintimefunct();
+  if (spintime <= 0) spintime = 1000;
+  // First time or after long pause: avoid huge delta and overflow in previoustime update
+  if (previoustime == 0) {
+    previoustime = currentime;
+    angle = 0;
+    return 0;
   }
-  return angle;
+  unsigned long long delta = currentime - previoustime;
+  angle = (int)((double)delta / (double)spintime * 360.0);
+  // Reset revolution start when we've passed one full period (no signed overflow)
+  if (delta >= (unsigned long long)spintime) {
+    previoustime = currentime - (delta % (unsigned long long)spintime);
+  }
+  return (int)angle;
 }
 
 bool isAngleInRange(float center, float range)
@@ -463,7 +472,7 @@ void heading_funct()
 
 void heading_adj()
 {
-  if(offset < 0.8 or offset > 1.2)
+  if(offset < 0.7 or offset > 1.3)
   {
     offset = 1.0;
   }
@@ -473,13 +482,19 @@ void heading_adj()
     EEPROM.put(OFFSET_ADDR, offset);
     EEPROM.commit();  // Required on ESP32 to finalize the write
     off_set = true;
+    Serial.print("[cal] offset -0.004 -> ");
+    Serial.println(offset, 4);
+    yield();  // Let other tasks run after blocking commit
   }
   else if(duty[4] > 70 && off_set == false)
   {
     offset = offset + 0.004;
     EEPROM.put(OFFSET_ADDR, offset);
-    EEPROM.commit();  // Required on ESP32 to finalize the write
+    EEPROM.commit();
     off_set = true;
+    Serial.print("[cal] offset +0.004 -> ");
+    Serial.println(offset, 4);
+    yield();
   }
   else if(duty[4] > 40 && duty[4] < 60)
   {
@@ -491,8 +506,9 @@ float readOffsetFromEEPROM()
 {
   float val;
   EEPROM.get(OFFSET_ADDR, val);
-  if (isnan(val) || abs(val) > 360.0) { // sanity check
-    return 0.0;
+  // offset should be 0.8-1.2 for spintime tuning
+  if (isnan(val) || val < 0.5f || val > 2.0f) {
+    return 1.0f;
   }
   return val;
 }
@@ -503,22 +519,31 @@ void led_update_task(void *pvParameters) {
   Serial.println("  [LED Task] Started");
   
   static int last_displayed_angle = -999;  // Track last displayed angle
-  static String last_processed_status = "";  // Track last processed status
+  static char last_processed_status[32] = "";  // Fixed buffer, no heap (was String)
   static unsigned long last_anim_update = 0;  // For animation timing
   static unsigned long last_armed_update = 0;  // For armed status animation timing
   static int anim_index = 0;  // Animation index (local to task)
   static int anim_direction = 1;  // Animation direction
   
   const int ANGLE_PRECISION = 5;  // 5° precision (72 updates per rotation)
-  
+  static float last_pulse_position = -1.0f;
+
   while (1) {
     int64_t t0 = esp_timer_get_time();
-    // Read shared variables (atomic reads)
+    // Read shared variables (atomic for ints; mutex for status string to avoid torn read)
     int current_angle = led_angle_shared;
     int current_rpm = led_rpm_shared;
+    bool current_motor_on = led_motor_on_shared;
+    float current_pulse_pos = led_pulse_position_shared;
+    int current_transpeed = led_transpeed_shared;
     char current_status[32];
-    strncpy(current_status, led_status_shared, sizeof(current_status) - 1);
-    current_status[sizeof(current_status) - 1] = '\0';  // Ensure null termination
+    if (led_status_mutex != NULL && xSemaphoreTake(led_status_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      strncpy(current_status, led_status_shared, sizeof(current_status) - 1);
+      current_status[sizeof(current_status) - 1] = '\0';
+      xSemaphoreGive(led_status_mutex);
+    } else {
+      current_status[0] = '\0';
+    }
     bool status_changed = led_data_changed;
     
     // Calculate angle difference with wrap-around handling
@@ -536,12 +561,19 @@ void led_update_task(void *pvParameters) {
     }
     
     // Update if status changed
-    if (status_changed || strcmp(current_status, last_processed_status.c_str()) != 0) {
+    if (status_changed || strcmp(current_status, last_processed_status) != 0) {
       need_update = true;
       led_data_changed = false;  // Clear flag
-      last_processed_status = String(current_status);
+      strncpy(last_processed_status, current_status, sizeof(last_processed_status) - 1);
+      last_processed_status[sizeof(last_processed_status) - 1] = '\0';
     }
-    
+    // Update when motor-on gradient changes (pulse position or transpeed)
+    if (current_motor_on && (fabsf(current_pulse_pos - last_pulse_position) > 0.05f)) {
+      need_update = true;
+      last_pulse_position = current_pulse_pos;
+    }
+    if (!current_motor_on) last_pulse_position = -1.0f;
+
     // Update animation index for failsafe mode
     if (strcmp(current_status, "failsafe") == 0 && (millis() - last_anim_update) > animSpeed) {
       anim_index += anim_direction;
@@ -570,11 +602,9 @@ void led_update_task(void *pvParameters) {
       {
         if (current_rc_status == false) 
         {
-          // yellow bounce chase
+          // yellow bounce chase (top strip only)
           top_strip.clear();
-          bottom_strip.clear();
           top_strip.setPixelColor(anim_index, 100, 80, 0);
-          bottom_strip.setPixelColor(anim_index, 100, 80, 0);
         }
         else
         {
@@ -584,9 +614,6 @@ void led_update_task(void *pvParameters) {
           for (int i = 0; i < NUMPIXELST; i++) {
             top_strip.setPixelColor(i, 0, 0, brightness);
           }
-          for (int i = 0; i < NUMPIXELSB; i++) {
-            bottom_strip.setPixelColor(i, 0, 0, brightness);
-          }
         }
       }
       else if (strcmp(current_status, "export") == 0)
@@ -594,37 +621,49 @@ void led_update_task(void *pvParameters) {
         for (int i = 0; i < NUMPIXELST; i++) {
           top_strip.setPixelColor(i, 100, 100, 100);
         }
-        for (int i = 0; i < NUMPIXELSB; i++) {
-          bottom_strip.setPixelColor(i, 100, 100, 100);
-        }
       }
       else if (strcmp(current_status, "armed") == 0)
       {
         top_strip.clear();
-        bottom_strip.clear();
         for (int i = 0; i < NUMPIXELST; i++) {
           top_strip.setPixelColor(i, 100, 0, 0);
-        }
-        for (int i = 0; i < NUMPIXELSB; i++) {
-          bottom_strip.setPixelColor(i, 100, 15, 0);
         }
       }
       else if (strcmp(current_status, "heading on") == 0) 
       {
+        // Light only the LED(s) at floor 0° (forward): direction the robot will travel. Same reference as motor.
+        top_strip.clear();
+        float heading_center = (float)LEDheading;
         for (int i = 0; i < NUMPIXELST; i++) {
-          top_strip.setPixelColor(i, 0, 255, 0);
-        }
-        for (int i = 0; i < NUMPIXELSB; i++) {
-          bottom_strip.setPixelColor(i, 0, 255, 100);
+          float led_floor_deg = fmodf((float)(i * 36 + LED_STRIP_OFFSET_DEG) + 360.0f, 360.0f);
+          float diff = fabsf(fmodf(led_floor_deg - heading_center + 540.0f, 360.0f) - 180.0f);
+          if (diff <= (float)LED_HEADING_HALF_DEG) {
+            top_strip.setPixelColor(i, 255, 80, 0);  // Fiery orange at forward
+          }
         }
       }
       else if (strcmp(current_status, "motor on") == 0) 
       {
+        // Light only the LED(s) at current rotation angle (floor diagram): motor pulses here, so indicator here.
+        // Green = accelerating, red = decelerating; brightness by transpeed. Same 0° = forward reference.
+        top_strip.clear();
+        float pulse_center = (float)(current_angle % 360);
+        if (pulse_center < 0) pulse_center += 360.0f;
+        float pos = current_pulse_pos;
+        if (pos < 0.0f) pos = 0.0f;
+        if (pos > 1.0f) pos = 1.0f;
+        int r = (int)(255.0f * pos);
+        int g = (int)(255.0f * (1.0f - pos));
+        int brightness = (180 * current_transpeed) / 100;
+        if (brightness > 180) brightness = 180;
+        r = (r * brightness) / 255;
+        g = (g * brightness) / 255;
         for (int i = 0; i < NUMPIXELST; i++) {
-          top_strip.setPixelColor(i, 80, 0, 0);
-        }
-        for (int i = 0; i < NUMPIXELSB; i++) {
-          bottom_strip.setPixelColor(i, 80, 0, 0);
+          float led_floor_deg = fmodf((float)(i * 36 + LED_STRIP_OFFSET_DEG) + 360.0f, 360.0f);
+          float diff = fabsf(fmodf(led_floor_deg - pulse_center + 540.0f, 360.0f) - 180.0f);
+          if (diff <= (float)LED_MOTOR_ARC_HALF_DEG) {
+            top_strip.setPixelColor(i, r, g, 0);
+          }
         }
       }
       else if (strcmp(current_status, "reading") == 0)
@@ -632,18 +671,13 @@ void led_update_task(void *pvParameters) {
         for (int i = 0; i < NUMPIXELST; i++) {
           top_strip.setPixelColor(i, 0, 0, 255);
         }
-        for (int i = 0; i < NUMPIXELSB; i++) {
-          bottom_strip.setPixelColor(i, 0, 0, 255);
-        }
       }
       else 
       {
         top_strip.clear();
-        bottom_strip.clear();
       }
       
       top_strip.show();
-      bottom_strip.show();
       
       // Update last displayed angle
       last_displayed_angle = current_angle;
@@ -660,20 +694,20 @@ void led_update_task(void *pvParameters) {
 // Legacy updateLED function - now just updates shared variables (non-blocking)
 void updateLED() 
 {
-  // Update shared variables for background LED task (non-blocking)
-  static String last_status = "";
+  static char last_status[32] = "";
   
   led_angle_shared = angle;
   led_rpm_shared = rpm;
   
-  // Copy String to char array (thread-safe)
-  strncpy(led_status_shared, LEDStatus.c_str(), sizeof(led_status_shared) - 1);
-  led_status_shared[sizeof(led_status_shared) - 1] = '\0';  // Ensure null termination
-  
-  // Check if status changed
-  if (LEDStatus != last_status) {
+  if (strcmp(LEDStatus.c_str(), last_status) != 0) {
     led_data_changed = true;
-    last_status = LEDStatus;
+    strncpy(last_status, LEDStatus.c_str(), sizeof(last_status) - 1);
+    last_status[sizeof(last_status) - 1] = '\0';
+  }
+  if (led_status_mutex != NULL && xSemaphoreTake(led_status_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+    strncpy(led_status_shared, LEDStatus.c_str(), sizeof(led_status_shared) - 1);
+    led_status_shared[sizeof(led_status_shared) - 1] = '\0';
+    xSemaphoreGive(led_status_mutex);
   }
   
   // LED task handles all the actual LED updates in background
@@ -681,54 +715,62 @@ void updateLED()
 }
 
 //=============MOTOR CONTROL FUNCTIONS==================
+// DShot is sent by dshot_task on Core 1 at 6 kHz. Main loop only sets motorL/motorR.
 void update_motors()
 {
-  // Safety clamp: prevent values outside valid DShot 3D range (-999 to 999)
-  if (motorL > 999) motorL = 999;
-  if (motorL < -999) motorL = -999;
-  if (motorR > 999) motorR = 999;
-  if (motorR < -999) motorR = -999;
-  
-  unsigned long long current_time = esp_timer_get_time();
-  
-  // Check both motors independently and send to whichever is ready
-  // This prevents long delays when one motor's timing condition isn't met
-  // Maintain minimum 100us spacing between sends to avoid RMT conflicts
-  // Fixed: Check both motors every iteration instead of strict alternation
-  
-  bool right_ready = (current_time - motorRsent) >= 100;
-  bool left_ready = (current_time - motorLsent) >= 100;
-  unsigned long long time_since_last_send = 0;
-  
-  // If both are ready, send to the one that was sent longest ago first
-  // This ensures fair scheduling and prevents one motor from starving
-  if (right_ready || left_ready) {
-    int64_t t0 = esp_timer_get_time();
-    if (right_ready && left_ready) {
-      // Send to the motor that was sent longest ago
-      if ((current_time - motorRsent) >= (current_time - motorLsent)) {
-        escR.sendThrottle3D(motorR);
-        motorRsent = current_time;
-      } else {
-        escL.sendThrottle3D(motorL);
-        motorLsent = current_time;
-      }
-    } else if (right_ready) {
-      escR.sendThrottle3D(motorR);
-      motorRsent = current_time;
-    } else {
-      escL.sendThrottle3D(motorL);
-      motorLsent = current_time;
+  // Safety clamp in main thread (DShot task also clamps when sending)
+  int l = (int)motorL, r = (int)motorR;
+  if (l > 999) motorL = 999;
+  if (l < -999) motorL = -999;
+  if (r > 999) motorR = 999;
+  if (r < -999) motorR = -999;
+}
+
+// Runs on Core 1 only at DSHOT_SEND_HZ for steady ESC timing (no main-loop jitter).
+void dshot_task(void *pvParameters)
+{
+  Serial.println("  [DShot Task] Started on Core 1");
+  // Let setup() on Core 0 finish (watchdog, Serial) before we start sending
+  vTaskDelay(pdMS_TO_TICKS(200));
+  int64_t next_wake_us = esp_timer_get_time();
+  for (;;) {
+    int64_t now_us = esp_timer_get_time();
+    while (now_us < next_wake_us) {
+      int64_t delay_us = next_wake_us - now_us;
+      if (delay_us > 1000)
+        vTaskDelay(pdMS_TO_TICKS(1));
+      else if (delay_us > 0)
+        delayMicroseconds((unsigned)delay_us);
+      now_us = esp_timer_get_time();
     }
-    prof_record(PROF_ESC, (uint32_t)(esp_timer_get_time() - t0));
-    motorRsend = !motorRsend;
+    next_wake_us += DSHOT_PERIOD_US;
+    if (next_wake_us <= now_us)
+      next_wake_us = now_us + DSHOT_PERIOD_US;
+
+    int64_t t0 = esp_timer_get_time();
+    int l = (int)motorL, r = (int)motorR;
+    if (l > 999) l = 999;
+    if (l < -999) l = -999;
+    if (r > 999) r = 999;
+    if (r < -999) r = -999;
+
+    escR.sendThrottle3D(r);
+    delayMicroseconds(25);
+    escL.sendThrottle3D(l);
+
+    int64_t t1 = esp_timer_get_time();
+    prof_record(PROF_ESC, (uint32_t)(t1 - t0));
+
+    // Yield every iteration so main loop gets CPU and can feed watchdog (was every 500 iters -> loop starved -> TASK_WDT)
+    taskYIELD();
   }
 }
 
 void spin()
 {
   motor_on = false;
-  
+  led_motor_on_shared = false;
+
   // Read duty[3] and rpm once to prevent race condition with CRSF updates
   // This ensures we use consistent values throughout the calculation
   int ch3_duty = duty[3];
@@ -824,6 +866,9 @@ void translate()
         motorL = map(transpeed, 0, 100, spinspeed, 1000);
       }
       motor_on = true;
+      led_motor_on_shared = true;
+      led_pulse_position_shared = (duration > 0) ? ((float)dtime / (float)duration) : 0.0f;
+      led_transpeed_shared = transpeed;
     }
     else
     {
@@ -855,6 +900,9 @@ void translate()
         motorR = map(transpeed, 0, 100, spinspeed, 1000);
       }
       motor_on = true;
+      led_motor_on_shared = true;
+      led_pulse_position_shared = (duration > 0) ? ((float)dtime / (float)duration) : 0.0f;
+      led_transpeed_shared = transpeed;
     }
     else
     {
@@ -957,14 +1005,18 @@ void wifi_mode()   //turns on wifi mode to connect wirelessly
     update_motors();  // Continuously send stop commands to ESCs
     ArduinoOTA.handle();
     
-    // Print status periodically while in wifi mode
-    if (millis() - lastWifiPrint > 500) {
-      Serial.print("WIFI MODE | CH5:");
-      Serial.print(duty[5]);
-      Serial.print(" | CH6:");
-      Serial.print(duty[6]);
-      Serial.println(" | Flip CH5 OFF to exit");
+    // Print basics periodically while in wifi mode (L, R, G, CH3)
+    if (millis() - lastWifiPrint > 200) {
       lastWifiPrint = millis();
+      Serial.print("L=");
+      Serial.print(motorL);
+      Serial.print(" R=");
+      Serial.print(motorR);
+      Serial.print(" G=");
+      Serial.print(last_gforce_raw, 2);
+      Serial.print(" CH3=");
+      Serial.print(duty[3]);
+      Serial.println(" [wifi]");
     }
     
     if(duty[6] < 50)  //if export switch is not triggered, will not export
@@ -980,21 +1032,21 @@ void wifi_mode()   //turns on wifi mode to connect wirelessly
     }
   }
   Serial.println("=== EXITING WIFI MODE ===");
-  WiFi.softAPdisconnect(false);  //turn off wifi
-  WiFi.mode(WIFI_OFF);  // Explicitly disable WiFi to stop all background tasks
+  WiFi.softAPdisconnect(false);
+  WiFi.mode(WIFI_OFF);
   delay(500);
-  for (int i = 0; i < 2500; i++)
-  {
+  // Re-arm ESCs: suspend DShot task so we own RMT, then send 0 repeatedly
+  if (dshot_task_handle) vTaskSuspend(dshot_task_handle);
+  for (int i = 0; i < 2500; i++) {
     escR.writeData(0, true);
     delayMicroseconds(400);
     escL.writeData(0, true);
     delayMicroseconds(400);
   }
-  // Explicitly reset motor values to 0 after re-arming
   motorL = 0;
   motorR = 0;
-  update_motors();  // Send stop command to ensure motors are stopped
-  esp_task_wdt_init(WDT_TIMEOUT, true);  // enable watchdog
+  if (dshot_task_handle) vTaskResume(dshot_task_handle);
+  esp_task_wdt_init(WDT_TIMEOUT, true);
 }
 
 void data_export()    //exports data to telnet client for diagnostics, wifi mode must be turned on first
@@ -1009,8 +1061,6 @@ void data_export()    //exports data to telnet client for diagnostics, wifi mode
   TelnetStream.println(max_rpm);
   TelnetStream.print("loop time: ");
   TelnetStream.println(loop_time);
-  TelnetStream.print("battery: ");
-  TelnetStream.println(volts);
   TelnetStream.print("Max G-Force: ");
   TelnetStream.println(max_gforce);
   TelnetStream.print("G-force output: ");
@@ -1025,16 +1075,6 @@ void data_export()    //exports data to telnet client for diagnostics, wifi mode
 }
 
 //=============MAIN FUNCTIONS==================
-void get_battery()  //calculates battery voltage based on voltage divider input on pin A0
-{
-  // Use millis() for battery check (only runs every 1s, so overhead is negligible)
-  if ((millis() - batloop) > 1000) //samples every second to avoid flickering
-  {
-    volts = (float(analogRead(volt_pin)) / float(310.0)) * 1.29;
-    batloop = millis();
-  }
-}
-
 void failsafe() //failsafe mode, shuts off all motors
 {
       LEDStatus = "failsafe";
@@ -1093,13 +1133,14 @@ void setup()
   Serial.println(test_xyz[2]);
   
   Serial.println("  Accelerometer configured (400g range, 400Hz)");
-  xTaskCreate(
+  xTaskCreatePinnedToCore(
     accel_spi_read_task,
     "Accel_SPI",
     2048,
     NULL,
     1,
-    &accel_task_handle
+    &accel_task_handle,
+    0
   );
   accel_initialized = true;
   Serial.println("  Background accel SPI task started");
@@ -1115,43 +1156,42 @@ void setup()
     Serial.println("ERROR: CRSF initialization failed!");
   } else {
     Serial.println("CRSF initialized successfully.");
-    
-    // Start background CRSF read task (non-blocking, updates every 5ms)
-    xTaskCreate(
-      crsf_read_task,      // Task function
-      "CRSF_Read",         // Task name
-      2048,                // Stack size
-      NULL,                // Parameters
-      1,                   // Priority (low, so main loop has priority)
-      &crsf_task_handle    // Task handle
+    xTaskCreatePinnedToCore(
+      crsf_read_task,
+      "CRSF_Read",
+      2048,
+      NULL,
+      1,
+      &crsf_task_handle,
+      0
     );
     crsf_task_initialized = true;
     Serial.println("  Background CRSF read task started (non-blocking, 200Hz)");
   }
   
-  Serial.println("Starting LED strips (DotStar)...");
-  top_strip.begin(); //initializes LEDs
-  bottom_strip.begin();
-  top_strip.clear();  // Turn all LEDs off ASAP
-  bottom_strip.clear();
-  top_strip.show();   // Send clear command
-  bottom_strip.show(); // Send clear command
+  Serial.println("Starting LED strip (DotStar, top only)...");
+  top_strip.begin();
+  top_strip.setBrightness(85);  // 1/3 brightness for testing (255/3 ≈ 85)
+  top_strip.clear();
+  top_strip.show();
   
-  // Initialize shared LED variables
+  // Initialize shared LED variables and mutex for thread-safe status string
   led_angle_shared = 0;
   led_rpm_shared = 0;
   strncpy(led_status_shared, "export", sizeof(led_status_shared) - 1);
   led_status_shared[sizeof(led_status_shared) - 1] = '\0';
   led_data_changed = true;
+  if (led_status_mutex == NULL)
+    led_status_mutex = xSemaphoreCreateMutex();
   
-  // Start background LED update task (non-blocking, angle-based with 5° precision)
-  xTaskCreate(
-    led_update_task,      // Task function
-    "LED_Update",         // Task name
-    4096,                 // Stack size (larger for LED logic)
-    NULL,                 // Parameters
-    1,                    // Priority (low, so main loop has priority)
-    &led_task_handle      // Task handle
+  xTaskCreatePinnedToCore(
+    led_update_task,
+    "LED_Update",
+    4096,
+    NULL,
+    1,
+    &led_task_handle,
+    0
   );
   led_task_initialized = true;
   Serial.println("  Background LED update task started (non-blocking, 5° precision)");
@@ -1176,16 +1216,34 @@ void setup()
   Serial.println("Arming ESCs...");
   for (int i = 0; i < 2500; i++) //arm esc's
   {
+    if (i % 500 == 0) {
+      Serial.print("  arm ");
+      Serial.println(i);
+    }
     escR.writeData(0, true);
     delayMicroseconds(400);
     escL.writeData(0, true);
     delayMicroseconds(400);
   }
+  Serial.println("  Arming loop done.");
   escR.setReversed(false);
   escR.set3DMode(true);
   delayMicroseconds(200);
   escL.setReversed(false);
   escL.set3DMode(true);
+  Serial.println("  setReversed/set3D done.");
+
+  // DShot on Core 1 so main loop on Core 0 can run and feed watchdog (fixes TASK_WDT crash)
+  xTaskCreatePinnedToCore(
+    dshot_task,
+    "DShot",
+    8192,
+    NULL,
+    1,
+    &dshot_task_handle,
+    1     // Core 1
+  );
+  Serial.println("  DShot task started on Core 1 (6 kHz)");
 
   Serial.println("Starting watchdog...");
   esp_task_wdt_init(WDT_TIMEOUT, true);  // Enable panic so ESP32 restarts, esp_task_wdt_reset(); feeds watchdog
@@ -1207,6 +1265,7 @@ void setup()
 
 void loop() 
 {
+  esp_task_wdt_reset();  // Feed watchdog at start so one slow iteration (e.g. Serial block) doesn't trigger reboot
   unsigned long long t0 = esp_timer_get_time();
   
   update_channels();
@@ -1218,8 +1277,8 @@ void loop()
     failsafe();
     unsigned long long t1 = esp_timer_get_time();
     prof_record(PROF_LOOP, (uint32_t)(t1 - t0));
-    prof_report();
-    // Debug output (5Hz) - also when in failsafe
+    prof_report();  // Print task CPU-time summary every 1s (throttled inside)
+    // Debug (5Hz) in failsafe
     static unsigned long long last_failsafe_debug_us = 0;
     if ((t1 - last_failsafe_debug_us) >= DEBUG_PRINT_INTERVAL_US) {
       last_failsafe_debug_us = t1;
@@ -1227,17 +1286,22 @@ void loop()
       Serial.print(motorL);
       Serial.print(" R=");
       Serial.print(motorR);
-      Serial.print(" CH3=");
-      Serial.print(pwm[3]);
       Serial.print(" G=");
       Serial.print(last_gforce_raw, 2);
-      // If last_crsf_update is 0, no valid CRSF packet has ever been received (wiring/baud/receiver)
-      Serial.print(" crsf_us=");
-      Serial.print((unsigned long)last_crsf_update);
+      Serial.print(" rpm=");
+      Serial.print(rpm);
+      Serial.print(" ang=");
+      Serial.print(angle);
+      Serial.print(" off=");
+      Serial.print(offset, 3);
+      Serial.print(" CH4=");
+      Serial.print(duty[4]);
+      Serial.print(" CH3=");
+      Serial.print(duty[3]);
       Serial.println(" [failsafe]");
     }
     esp_task_wdt_reset();
-    // Yield so CRSF task can run and read Serial1; otherwise main loop starves it at same priority
+    // Yield so CRSF task can run
     vTaskDelay(pdMS_TO_TICKS(1));
     return;
   }
@@ -1252,7 +1316,7 @@ void loop()
   if(rpm > 400)
   {
     angle = rotation_angle();
-    if (isAngleInRange(LEDheading, 20)) // LED turns on within ±10° of heading
+    if (isAngleInRange(LEDheading, LED_HEADING_HALF_DEG))  // LED on when pointing at floor 0° (forward)
     {
       LEDStatus = "heading on";
     }
@@ -1346,9 +1410,9 @@ void loop()
   loop_time_sum_us += loopTime_us;
   
   prof_record(PROF_LOOP, (uint32_t)loopTime_us);
-  prof_report();
-  
-  // Debug output at 5Hz: motor speeds, channel 3, accelerometer
+  prof_report();  // Print task CPU-time summary every 1s (throttled inside)
+
+  // Debug at 5Hz: L/R throttle, G force, CH3
   static unsigned long long last_debug_print_us = 0;
   unsigned long long now_us = esp_timer_get_time();
   if ((now_us - last_debug_print_us) >= DEBUG_PRINT_INTERVAL_US) {
@@ -1357,12 +1421,19 @@ void loop()
     Serial.print(motorL);
     Serial.print(" R=");
     Serial.print(motorR);
-    Serial.print(" CH3=");
-    Serial.print(pwm[3]);
     Serial.print(" G=");
     Serial.print(last_gforce_raw, 2);
-    Serial.println();
+    Serial.print(" rpm=");
+    Serial.print(rpm);
+    Serial.print(" ang=");
+    Serial.print(angle);
+    Serial.print(" off=");
+    Serial.print(offset, 3);
+    Serial.print(" CH4=");
+    Serial.print(duty[4]);
+    Serial.print(" rst=");
+    Serial.print(off_set ? "1" : "0");
+    Serial.print(" CH3=");
+    Serial.println(duty[3]);
   }
-  
-  esp_task_wdt_reset();
 }

@@ -1,0 +1,10 @@
+# PlatformIO
+.pio/
+*.pyc
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
