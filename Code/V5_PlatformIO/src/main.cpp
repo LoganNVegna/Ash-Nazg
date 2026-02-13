@@ -221,11 +221,10 @@ static SemaphoreHandle_t led_status_mutex = NULL;  // Protects led_status_shared
 
 //------Driving characteristcs------
 // Unified "floor diagram" angles: 0° = forward (direction robot moves). rotation_angle() should be
-// calibrated so 0° = forward; then heading LED and motor pulse LED both use this same reference.
+// calibrated so 0° = forward. LED strip is a straight line from center to edge (one spoke); all 10 LEDs
+// are at the same angle, so we always drive the full strip the same (no per-LED angle).
 const int LEDheading = 0;
-const int LED_STRIP_OFFSET_DEG = 30;  // LED strip start is this many degrees clockwise from forward (0°)
-const int LED_HEADING_HALF_DEG = 10;  // Heading LED on within ±this of 0°
-const int LED_MOTOR_ARC_HALF_DEG = 27;  // Motor-on LED arc half-width (~15% of 360°)
+const int LED_HEADING_HALF_DEG = 5;   // Heading LED on when rotation angle within ±5° of 0°
 const int percentdecel = 15; //percentage of rotation the translation deceleration wave occurs for each motor. Should be <= 50
 const float acc_rate = 0.4; //0.2(least aggressive spinup) - 1.0(most aggressive spinup)
 
@@ -235,7 +234,9 @@ const char *password = "meltybrain"; //wifi password
 // Start TelnetStream: Enter telnet {insert ip address} for me: telnet 192.168.4.1 in CMD to view output
 
 //-----other constants-------
-const int denom = round(1.0 / sqrt(0.00001118*accradius)); //calculates denominator ahead of time to reduce unnecessary calculations;
+// RPM from G: use same formula as OpenMelt (G = 0.00001118*r*RPM^2 with r in cm) -> RPM = sqrt(G*89445/r_cm)
+// accradius is in mm; convert to cm for formula so we don't undercount RPM by ~3x.
+const float accradius_cm = (float)accradius / 10.0f;
 const int OFFSET_ADDR = 0;  // EEPROM address to store rpm offset
 const int WDT_TIMEOUT = 5;  // seconds
 
@@ -340,16 +341,13 @@ static unsigned int loop_time_count = 0;
 
 
 //=============HEADING FUNCTIONS==================
-void calcrpm()  // calculates the rpm based on g-force
+void calcrpm()  // calculates the rpm based on g-force (OpenMelt-style: G*89445/r_cm then sqrt)
 {
-  float gforce;
-  gforce = fabs(get_accel_force_g());
-  rpm = round(sqrt(gforce) * denom);
+  float gforce = fabs(get_accel_force_g());
+  float rpm_f = sqrtf(gforce * 89445.0f / accradius_cm);
+  rpm = (int)(rpm_f + 0.5f);
 
-  if(rpm > max_rpm) 
-  {
-    max_rpm = rpm;
-  }
+  if (rpm > max_rpm) max_rpm = rpm;
 }
 
 long long spintimefunct()
@@ -472,9 +470,9 @@ void heading_funct()
 
 void heading_adj()
 {
-  if(offset < 0.7 or offset > 1.3)
-  {
-    offset = 1.0;
+  // Allow 0.5–1.5 so you can calibrate spintime (e.g. offset 0.5 => 2x angle rate => ~2 pulses per real rotation if RPM was low).
+  if (offset < 0.5f || offset > 1.5f) {
+    offset = 1.0f;
   }
   if(duty[4] < 30 && off_set == false)
   {
@@ -631,39 +629,22 @@ void led_update_task(void *pvParameters) {
       }
       else if (strcmp(current_status, "heading on") == 0) 
       {
-        // Light only the LED(s) at floor 0° (forward): direction the robot will travel. Same reference as motor.
-        top_strip.clear();
-        float heading_center = (float)LEDheading;
+        // Full strip: fiery orange when pointing in direction of travel (0°).
         for (int i = 0; i < NUMPIXELST; i++) {
-          float led_floor_deg = fmodf((float)(i * 36 + LED_STRIP_OFFSET_DEG) + 360.0f, 360.0f);
-          float diff = fabsf(fmodf(led_floor_deg - heading_center + 540.0f, 360.0f) - 180.0f);
-          if (diff <= (float)LED_HEADING_HALF_DEG) {
-            top_strip.setPixelColor(i, 255, 80, 0);  // Fiery orange at forward
-          }
+          top_strip.setPixelColor(i, 255, 80, 0);
         }
       }
       else if (strcmp(current_status, "motor on") == 0) 
       {
-        // Light only the LED(s) at current rotation angle (floor diagram): motor pulses here, so indicator here.
-        // Green = accelerating, red = decelerating; brightness by transpeed. Same 0° = forward reference.
-        top_strip.clear();
-        float pulse_center = (float)(current_angle % 360);
-        if (pulse_center < 0) pulse_center += 360.0f;
-        float pos = current_pulse_pos;
-        if (pos < 0.0f) pos = 0.0f;
-        if (pos > 1.0f) pos = 1.0f;
-        int r = (int)(255.0f * pos);
-        int g = (int)(255.0f * (1.0f - pos));
-        int brightness = (180 * current_transpeed) / 100;
+        // Full strip: green, brightness = current throttle (pulses at 90° and 270° only, dim at 0°/180°).
+        float throttle_01 = current_pulse_pos;
+        if (throttle_01 < 0.0f) throttle_01 = 0.0f;
+        if (throttle_01 > 1.0f) throttle_01 = 1.0f;
+        int brightness = (int)(throttle_01 * (float)(180 * current_transpeed / 100));
         if (brightness > 180) brightness = 180;
-        r = (r * brightness) / 255;
-        g = (g * brightness) / 255;
+        int g = brightness;
         for (int i = 0; i < NUMPIXELST; i++) {
-          float led_floor_deg = fmodf((float)(i * 36 + LED_STRIP_OFFSET_DEG) + 360.0f, 360.0f);
-          float diff = fabsf(fmodf(led_floor_deg - pulse_center + 540.0f, 360.0f) - 180.0f);
-          if (diff <= (float)LED_MOTOR_ARC_HALF_DEG) {
-            top_strip.setPixelColor(i, r, g, 0);
-          }
+          top_strip.setPixelColor(i, 0, g, 0);
         }
       }
       else if (strcmp(current_status, "reading") == 0)
@@ -803,112 +784,56 @@ void spin()
   motorL = spinspeed;
 }
 
+// Cosine-modulation translation: one motor at a time, throttle peaks when thrust is
+// parallel to travel (0°). That happens when the firing wheel is at 0° (world), i.e.
+// when bot angle is 90° or 270°. So we peak at 90° and 270°, not 0°/180°. No braking.
 void translate()
 {
-  unsigned long long currentime;
-  unsigned long long duration; //defines variable for decel duration in microseconds
-  int transpeed; //variable to store movement speed 0-100 from ch2 duty
-  currentime = esp_timer_get_time();
-  duration = spintimefunct() * float(percentdecel) * 0.01; //duration of total decel pulse
-  dtime = currentime - startime; //calculates time it's been since start of decel, will need a way to start the timer when decel initiates
-  // Read duty values and rpm once to prevent race condition with CRSF updates
-  // This ensures we use consistent values throughout the calculation
   int ch3_duty = duty[3];
   int ch2_duty = duty[2];
-  int current_rpm = rpm;  // Read once for consistency
-  
-  // Calculate RPM-based limit to prevent rapid acceleration
-  // Limit is acc_rate * rpm + 200, allowing higher speeds at higher RPM
+  int current_rpm = rpm;
   long rpm_limit = long(acc_rate * current_rpm) + 200;
-  
-  if(reversed == true)
-  {
+
+  if (reversed) {
     long requested = map(ch3_duty, 0, 100, 0, -1000);
     spinspeed = max(requested, -rpm_limit);
-    
-    // Enforce limit: never exceed the RPM-based limit (prevent rapid acceleration bypass)
     if (spinspeed < -rpm_limit) spinspeed = -rpm_limit;
-    
-    transpeed = abs(map(ch2_duty, 0, 100, -100, 100));  //-100 to 100 and due to formula, - will automatically switch motor direction without needing separate if statements
-  }
-  else
-  {
+  } else {
     long requested = map(ch3_duty, 0, 100, 0, 1000);
     spinspeed = min(requested, rpm_limit);
-    
-    // Enforce limit: never exceed the RPM-based limit (prevent rapid acceleration bypass)
     if (spinspeed > rpm_limit) spinspeed = rpm_limit;
-    
-    transpeed = abs(map(ch2_duty, 0, 100, 100, -100));  //-100 to 100 and due to formula, - will automatically switch motor direction without needing separate if statements
   }
-  if(angle > 180)
-  {
-    if(angle > 180 && angle < 250 && startimeset == false) //resets start time when 300 degrees is hit
-    {
-      startime = currentime;
-      dtime = 0;
-      startimeset = true;
-    }
-    if(angle > 250)
-    {
-      startimeset = false;
-    }
-    if(dtime < duration)
-    {
-      if(reversed == true)
-      {
-        motorR = map(transpeed, 0, 100, spinspeed, 0);
-        motorL = map(transpeed, 0, 100, spinspeed, -1000);
-      }
-      else
-      {
-        motorR = map(transpeed, 0, 100, spinspeed, 0);
-        motorL = map(transpeed, 0, 100, spinspeed, 1000);
-      }
-      motor_on = true;
-      led_motor_on_shared = true;
-      led_pulse_position_shared = (duration > 0) ? ((float)dtime / (float)duration) : 0.0f;
-      led_transpeed_shared = transpeed;
-    }
-    else
-    {
-      spin();
-    }
-  }
-  else
-  {
-    if(angle < 80 && startimeset == false) //resets start time when 120 degrees is hit
-    {
-      startime = currentime;
-      dtime = 0;
-      startimeset = true;
-    }
-    if(angle > 80)
-    {
-      startimeset = false;
-    }
-    if(dtime < duration)
-    {
-      if(reversed == true)
-      {
-        motorL = map(transpeed, 0, 100, spinspeed, 0);
-        motorR = map(transpeed, 0, 100, spinspeed, -1000);
-      }
-      else
-      {
-        motorL = map(transpeed, 0, 100, spinspeed, 0);
-        motorR = map(transpeed, 0, 100, spinspeed, 1000);
-      }
-      motor_on = true;
-      led_motor_on_shared = true;
-      led_pulse_position_shared = (duration > 0) ? ((float)dtime / (float)duration) : 0.0f;
-      led_transpeed_shared = transpeed;
-    }
-    else
-    {
-      spin();
-    }
-  }
+
+  int transpeed = abs(map(ch2_duty, 0, 100, 100, -100));  // 0-100 magnitude
+  bool forward_stick = (ch2_duty > 50);
+
+  // Throttle magnitude 0-1000 from transpeed
+  int mag = (transpeed * 1000) / 100;
+  if (mag > 1000) mag = 1000;
+
+  // Peak at 90° and 270° so instantaneous force is parallel to 0° (direction of travel).
+  float angle_rad = (float)(angle % 360) * (float)PI / 180.0f;
+  float cos_90  = cosf(angle_rad - (float)PI / 2.0f);   // 1 at 90°,  -1 at 270°
+  float cos_270 = cosf(angle_rad - (float)PI * 1.5f);    // 1 at 270°, -1 at 90°
+
+  float w90  = (cos_90  > 0.0f) ? cos_90  : 0.0f;
+  float w270 = (cos_270 > 0.0f) ? cos_270 : 0.0f;
+
+  // Forward + !reversed: one motor peaks at 90°, other at 270°. Swap for backward or when reversed.
+  bool swap_motors = (!forward_stick) || reversed;
+  int throt_L = (int)((swap_motors ? w270 : w90) * (float)mag);
+  int throt_R = (int)((swap_motors ? w90 : w270) * (float)mag);
+
+  motorL = throt_L;
+  motorR = throt_R;
+
+  motor_on = (transpeed > 0 && (throt_L > 0 || throt_R > 0));
+  led_motor_on_shared = motor_on;
+  // One strip, one pulse: only show motor LED when thrusting at 270° (not 90°) so we see one pulse per rotation.
+  int throttle_now = (throt_L > throt_R) ? throt_L : throt_R;
+  bool in_270_deg_half = (angle >= 180 && angle < 360);
+  led_pulse_position_shared = in_270_deg_half ? ((float)throttle_now / 1000.0f) : 0.0f;
+  led_transpeed_shared = transpeed;
 }
 
 //=============RC HANDLER FUNCTIONS==================
