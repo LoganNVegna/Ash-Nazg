@@ -784,9 +784,10 @@ void spin()
   motorL = spinspeed;
 }
 
-// Cosine-modulation translation: one motor at a time, throttle peaks when thrust is
-// parallel to travel (0°). That happens when the firing wheel is at 0° (world), i.e.
-// when bot angle is 90° or 270°. So we peak at 90° and 270°, not 0°/180°. No braking.
+// Cosine-modulation translation: maintain spin (constant total power) and shift power
+// between L/R for translation. motorL + motorR = 2*spinspeed so RPM doesn't drop when
+// translating (OpenMelt-style: same total "on" power; only phase shifts).
+// Thrust is parallel to travel when firing wheel is at 90° or 270° (world).
 void translate()
 {
   int ch3_duty = duty[3];
@@ -807,30 +808,34 @@ void translate()
   int transpeed = abs(map(ch2_duty, 0, 100, 100, -100));  // 0-100 magnitude
   bool forward_stick = (ch2_duty > 50);
 
-  // Throttle magnitude 0-1000 from transpeed
+  // Throttle magnitude 0-1000 from transpeed (translation differential only)
   int mag = (transpeed * 1000) / 100;
   if (mag > 1000) mag = 1000;
 
-  // Peak at 90° and 270° so instantaneous force is parallel to 0° (direction of travel).
+  // Peak at 90° and 270°. Use one weight (w90) for differential: + on L at 90°, - on R.
   float angle_rad = (float)(angle % 360) * (float)PI / 180.0f;
   float cos_90  = cosf(angle_rad - (float)PI / 2.0f);   // 1 at 90°,  -1 at 270°
-  float cos_270 = cosf(angle_rad - (float)PI * 1.5f);    // 1 at 270°, -1 at 90°
-
   float w90  = (cos_90  > 0.0f) ? cos_90  : 0.0f;
-  float w270 = (cos_270 > 0.0f) ? cos_270 : 0.0f;
 
-  // Forward + !reversed: one motor peaks at 90°, other at 270°. Swap for backward or when reversed.
+  // Translation differential: same magnitude, sign by direction. L = spin + T, R = spin - T => sum = 2*spinspeed.
   bool swap_motors = (!forward_stick) || reversed;
-  int throt_L = (int)((swap_motors ? w270 : w90) * (float)mag);
-  int throt_R = (int)((swap_motors ? w90 : w270) * (float)mag);
+  int trans = (int)((swap_motors ? -w90 : w90) * (float)mag);
 
-  motorL = throt_L;
-  motorR = throt_R;
+  int base = (int)spinspeed;
+  motorL = base + trans;
+  motorR = base - trans;
 
-  motor_on = (transpeed > 0 && (throt_L > 0 || throt_R > 0));
+  // Clamp to DShot 3D range [-999, 999]
+  if (motorL > 999) motorL = 999;
+  if (motorL < -999) motorL = -999;
+  if (motorR > 999) motorR = 999;
+  if (motorR < -999) motorR = -999;
+
+  motor_on = (transpeed > 0 && (motorL != 0 || motorR != 0));
   led_motor_on_shared = motor_on;
   // One strip, one pulse: only show motor LED when thrusting at 270° (not 90°) so we see one pulse per rotation.
-  int throttle_now = (throt_L > throt_R) ? throt_L : throt_R;
+  int throttle_now = (motorL > motorR) ? motorL : motorR;
+  if (throttle_now < 0) throttle_now = -throttle_now;
   bool in_270_deg_half = (angle >= 180 && angle < 360);
   led_pulse_position_shared = in_270_deg_half ? ((float)throttle_now / 1000.0f) : 0.0f;
   led_transpeed_shared = transpeed;
