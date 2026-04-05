@@ -999,7 +999,6 @@ void data_export()    //exports data to telnet client for diagnostics, wifi mode
     TelnetStream.print(",");
     TelnetStream.print(graph[i]);
   }
-  
   TelnetStream.println("============================");
   TelnetStream.stop(); // Close telnet connection
 }

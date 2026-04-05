@@ -128,7 +128,9 @@ esp_err_t DShotESC::sendThrottle(uint16_t throttle)
 
 esp_err_t DShotESC::sendThrottle3D(int16_t throttle)
 {
-	//clamp throttle between -999 and 999
+	// Reversible DShot uses 0 as stop, reverse in the low throttle range, and
+	// forward in the high throttle range. Do not route through sendThrottle(),
+	// because that always adds DSHOT_THROTTLE_MIN and would turn 0 into 48.
 	if (throttle > 999)
 	{
 		throttle = 999;
@@ -137,12 +139,25 @@ esp_err_t DShotESC::sendThrottle3D(int16_t throttle)
 	{
 		throttle = -999;
 	}
-	//if throttle is negative, wrap it from -999 to 0 to 1000 to 1999
+
+	if (throttle == 0)
+	{
+		return writePacket({0, 0}, false);
+	}
+
+	uint16_t raw;
 	if (throttle < 0)
 	{
-		throttle = 1000-throttle;
+		uint16_t mag = (uint16_t)(-throttle);  // 1..999
+		raw = (uint16_t)(49 + ((uint32_t)(mag - 1) * (1047 - 49)) / (999 - 1));
 	}
-	return sendThrottle(throttle);
+	else
+	{
+		uint16_t mag = (uint16_t)throttle;  // 1..999
+		raw = (uint16_t)(1048 + ((uint32_t)(mag - 1) * (2047 - 1048)) / (999 - 1));
+	}
+
+	return writePacket({raw, 0}, false);
 }
 
 esp_err_t DShotESC::setReversed(bool reversed)
