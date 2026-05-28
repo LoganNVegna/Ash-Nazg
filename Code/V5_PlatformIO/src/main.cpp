@@ -229,8 +229,8 @@ const int percentdecel = 15; //percentage of rotation the translation decelerati
 const float acc_rate = 0.4; //0.2(least aggressive spinup) - 1.0(most aggressive spinup)
 
 //-------Wifi config---------
-const char *ssid = "Beyblade"; //wifi ssid
-const char *password = "meltybrain"; //wifi password
+const char *ssid = "Ash Nazg"; //wifi ssid
+const char *password = "One ring"; //wifi password
 // Start TelnetStream: Enter telnet {insert ip address} for me: telnet 192.168.4.1 in CMD to view output
 
 //-----other constants-------
@@ -317,6 +317,17 @@ void data_export();
 void failsafe();
 
 static float last_gforce_raw = 0.0;
+// Stationary bias for LIS331 Y-axis (g). Calibrated once at boot while robot is still.
+static float accel_bias_g = 0.0f;
+static bool accel_bias_calibrated = false;
+
+// Noise floor (g) to treat as "not spinning". Prevents false RPM at rest from sensor bias/noise.
+static const float G_NOISE_FLOOR = 0.75f;
+
+// RPM gating/hysteresis to prevent LED/status flicker near threshold.
+static const int RPM_SPIN_ON  = 450;   // must exceed to enter "spinning"
+static const int RPM_SPIN_OFF = 350;   // must drop below to exit "spinning"
+static bool spin_detected = false;
 
 // Debug print: 5Hz only
 #define DEBUG_PRINT_INTERVAL_US 200000  // 200ms = 5Hz
@@ -344,6 +355,8 @@ static unsigned int loop_time_count = 0;
 void calcrpm()  // calculates the rpm based on g-force (OpenMelt-style: G*89445/r_cm then sqrt)
 {
   float gforce = fabs(get_accel_force_g());
+  // Ignore tiny readings so we don't compute bogus RPM while sitting still.
+  if (gforce < G_NOISE_FLOOR) gforce = 0.0f;
   float rpm_f = sqrtf(gforce * 89445.0f / accradius_cm);
   rpm = (int)(rpm_f + 0.5f);
 
@@ -401,6 +414,10 @@ float get_accel_force_g()
   // Get latest reading from background task (non-blocking, instant)
   float gforce;
   accel_read_y_nonblocking(&gforce);
+  // Remove stationary bias (calibrated at boot). This dramatically reduces "fake RPM" at rest.
+  if (accel_bias_calibrated) {
+    gforce -= accel_bias_g;
+  }
   
   // Update rolling average every 20ms (background task reads every 20ms)
   // Use cached time from last_i2c_update_time if available, otherwise get current time
@@ -1073,6 +1090,29 @@ void setup()
   );
   accel_initialized = true;
   Serial.println("  Background accel SPI task started");
+
+  // Calibrate accelerometer stationary bias at boot.
+  // Assumption: robot is sitting still during the first ~1 second of boot.
+  // This prevents noisy/biasy readings from being interpreted as RPM/angle when stopped.
+  {
+    Serial.println("Calibrating accel bias (keep robot still)...");
+    // Let the SPI accel task fill a few samples first.
+    delay(200);
+    const int N = 800;  // ~800ms @ 1kHz task + delay(1)
+    double sum = 0.0;
+    int count = 0;
+    for (int i = 0; i < N; i++) {
+      float g = 0.0f;
+      accel_read_y_nonblocking(&g);
+      sum += (double)g;
+      count++;
+      delay(1);
+    }
+    accel_bias_g = (count > 0) ? (float)(sum / (double)count) : 0.0f;
+    accel_bias_calibrated = true;
+    Serial.print("  Accel bias (g): ");
+    Serial.println(accel_bias_g, 4);
+  }
   
   Serial.println("Starting CRSF receiver...");
   Serial.print("  CRSF RX Pin: GPIO ");
@@ -1201,6 +1241,10 @@ void loop()
   heading_funct();
   heading_adj();
   calcrpm();
+
+  // Update spin detection with hysteresis to avoid flicker near threshold.
+  if (!spin_detected && rpm >= RPM_SPIN_ON) spin_detected = true;
+  if (spin_detected && rpm <= RPM_SPIN_OFF) spin_detected = false;
   
   if (!rc_status) {
     failsafe();
@@ -1242,7 +1286,9 @@ void loop()
   
   reversed = (duty[6] > 50);
   
-  if(rpm > 400)
+  // Only run heading/angle LED modes when we're actually spinning AND the user is commanding spin.
+  // This prevents erratic "heading on" flashes at rest caused by accel bias/noise.
+  if (spin_detected && duty[3] > 10)
   {
     angle = rotation_angle();
     if (isAngleInRange(LEDheading, LED_HEADING_HALF_DEG))  // LED on when pointing at floor 0° (forward)
@@ -1314,7 +1360,7 @@ void loop()
     motorR = 0;
   }
   
-  if(rpm < 400)
+  if(!spin_detected)
   {
     LEDStatus = "armed";
   }
