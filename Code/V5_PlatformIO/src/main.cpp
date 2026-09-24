@@ -202,9 +202,32 @@ static uint32_t lastCrsfPacket = 0;  // For failsafe detection
 
 // Non-blocking CRSF using FreeRTOS task (declared after NUM_CHANNELS)
 static volatile uint16_t crsf_channels[NUM_CHANNELS + 1] = {0};  // Shared channel data (indexed 1-NUM_CHANNELS)
-static volatile unsigned long last_crsf_update = 0;  // Timestamp of last CRSF update (microseconds)
+static volatile unsigned long last_crsf_update = 0;  // Timestamp of last CRSF UART activity (microseconds)
+static volatile bool crsf_link_up = true;
+static volatile uint32_t crsf_rx_bytes = 0;  // Incremented on every UART byte (proves link is live)
+static const unsigned long RC_FAILSAFE_TIMEOUT_US = 300000;  // 300ms without CRSF data -> stop
 static TaskHandle_t crsf_task_handle = NULL;
 static bool crsf_task_initialized = false;
+
+static void on_crsf_link_up() {
+  crsf_link_up = true;
+  last_crsf_update = esp_timer_get_time();
+}
+
+static void on_crsf_link_down() {
+  crsf_link_up = false;
+}
+
+static void on_crsf_raw_byte(int8_t) {
+  crsf_rx_bytes++;
+}
+
+// Receiver asserted failsafe in a channels frame (TX off / link lost).
+static void on_crsf_rc_channels(serialReceiverLayer::rcChannels_t *rc) {
+  if (rc != nullptr && rc->failsafe) {
+    crsf_link_up = false;
+  }
+}
 
 // Non-blocking LED using FreeRTOS task
 static volatile int led_angle_shared = 0;  // Current angle (0-359)
@@ -804,7 +827,7 @@ void spin()
 // Cosine-modulation translation: maintain spin (constant total power) and shift power
 // between L/R for translation. motorL + motorR = 2*spinspeed so RPM doesn't drop when
 // translating (OpenMelt-style: same total "on" power; only phase shifts).
-// Thrust is parallel to travel when firing wheel is at 90° or 270° (world).
+// Thrust peaks at 0°/180° (world) so forward/back align with the heading LED.
 void translate()
 {
   int ch3_duty = duty[3];
@@ -829,14 +852,14 @@ void translate()
   int mag = (transpeed * 1000) / 100;
   if (mag > 1000) mag = 1000;
 
-  // Peak at 90° and 270°. Use one weight (w90) for differential: + on L at 90°, - on R.
+  // Peak at 0° (forward) and 180° (back). Half-wave so each stick direction uses one pulse per rev.
   float angle_rad = (float)(angle % 360) * (float)PI / 180.0f;
-  float cos_90  = cosf(angle_rad - (float)PI / 2.0f);   // 1 at 90°,  -1 at 270°
-  float w90  = (cos_90  > 0.0f) ? cos_90  : 0.0f;
+  float cos_fwd = -cosf(angle_rad);  // thrust at 0°/180° (negated to match heading LED)
+  float w_fwd = (cos_fwd > 0.0f) ? cos_fwd : 0.0f;
 
   // Translation differential: same magnitude, sign by direction. L = spin + T, R = spin - T => sum = 2*spinspeed.
   bool swap_motors = (!forward_stick) || reversed;
-  int trans = (int)((swap_motors ? -w90 : w90) * (float)mag);
+  int trans = (int)((swap_motors ? -w_fwd : w_fwd) * (float)mag);
 
   int base = (int)spinspeed;
   motorL = base + trans;
@@ -867,16 +890,11 @@ void crsf_read_task(void *pvParameters) {
     int64_t t0 = esp_timer_get_time();
     // Update CRSF library (reads serial data)
     crsf.update();
-    
-    // Read all channels and store in shared volatile array
+
     for (int channel = 1; channel <= NUM_CHANNELS; channel++) {
-      uint16_t crsfVal = crsf.rcToUs(crsf.getChannel(channel));
-      crsf_channels[channel] = crsfVal;
+      crsf_channels[channel] = crsf.rcToUs(crsf.getChannel(channel));
     }
-    
-    // Update timestamp (atomic write - unsigned long is 32-bit, safe on ESP32)
-    last_crsf_update = esp_timer_get_time();
-    
+
     prof_record(PROF_CRSF, (uint32_t)(esp_timer_get_time() - t0));
     
     // Delay 5ms (200Hz update rate - sufficient for human reaction time)
@@ -884,40 +902,45 @@ void crsf_read_task(void *pvParameters) {
   }
 }
 
+static void apply_rc_failsafe_channels()
+{
+  // Neutral stick positions; CH3=0 kills spin command.
+  for (int channel = 1; channel <= NUM_CHANNELS; channel++) {
+    pwm[channel] = 1500;
+    duty[channel] = 50;
+  }
+  duty[3] = 0;
+  duty[5] = 100;
+  pwm[3] = 1000;
+}
+
 void update_channels()
 {
-  // Fast data copy from shared volatile variables (non-blocking)
-  // CRSF reading happens in background task every 5ms
-  
-  // Copy channel data from background task (atomic reads)
-  bool gotNewData = false;
+  static uint32_t last_rx_bytes = 0;
+  unsigned long now_us = esp_timer_get_time();
+  uint32_t rx_bytes = crsf_rx_bytes;
+
+  // UART activity = live CRSF stream (works even when stick values are unchanged).
+  if (rx_bytes != last_rx_bytes) {
+    last_rx_bytes = rx_bytes;
+    last_crsf_update = now_us;
+    crsf_link_up = true;
+  }
+
   for (int channel = 1; channel <= NUM_CHANNELS; channel++) {
-    uint16_t crsfVal = crsf_channels[channel];  // Atomic read
-    if (crsfVal > 0) {
-      gotNewData = true;
-    }
+    uint16_t crsfVal = crsf_channels[channel];
     pwm[channel] = crsfVal;
     duty[channel] = map(crsfVal, 1000, 2000, 0, 100);
   }
-  
-  // Failsafe detection - check if we're receiving valid data
-  unsigned long now_us = esp_timer_get_time();
-  unsigned long last_update_us = last_crsf_update;  // Atomic read
-  
-  if (gotNewData && pwm[1] > 900) {
-    rc_status = true;
-    lastCrsfPacket = now_us / 1000;  // Convert to milliseconds for compatibility
+
+  bool packet_recent = (last_crsf_update > 0) &&
+                       ((now_us - last_crsf_update) < RC_FAILSAFE_TIMEOUT_US);
+  rc_status = crsf_link_up && packet_recent;
+
+  if (!rc_status) {
+    apply_rc_failsafe_channels();
   } else {
-    // Check timeout (500ms = 500000 microseconds)
-    if (last_update_us > 0 && (now_us - last_update_us) > 500000) {
-      duty[1] = 50;
-      duty[2] = 50;
-      duty[3] = 0;
-      duty[4] = 50;
-      duty[5] = 100;
-      duty[6] = 0;
-      rc_status = false;
-    }
+    lastCrsfPacket = now_us / 1000;
   }
 }
 
@@ -1023,11 +1046,16 @@ void data_export()    //exports data to telnet client for diagnostics, wifi mode
 //=============MAIN FUNCTIONS==================
 void failsafe() //failsafe mode, shuts off all motors
 {
-      LEDStatus = "failsafe";
-      motorR = 0;
-      motorL = 0;
-      update_motors();  // Send stop command to ESCs
-      updateLED();
+  LEDStatus = "failsafe";
+  motorR = 0;
+  motorL = 0;
+  spinspeed = 0;
+  motor_on = false;
+  led_motor_on_shared = false;
+  spin_detected = false;
+  apply_rc_failsafe_channels();
+  update_motors();
+  updateLED();
 }
 
 //=============SETUP==================
@@ -1125,6 +1153,10 @@ void setup()
     Serial.println("ERROR: CRSF initialization failed!");
   } else {
     Serial.println("CRSF initialized successfully.");
+    crsf.setLinkUpCallback(on_crsf_link_up);
+    crsf.setLinkDownCallback(on_crsf_link_down);
+    crsf.setRawDataCallback(on_crsf_raw_byte);
+    crsf.setRcChannelsCallback(on_crsf_rc_channels);
     xTaskCreatePinnedToCore(
       crsf_read_task,
       "CRSF_Read",
@@ -1324,6 +1356,9 @@ void loop()
   }
   else if(duty[2] > 55 || duty[2] < 45 || duty[1] > 55 || duty[1] < 45) // Tank drive mode
   {
+    const int TANK_MAX_THROTTLE = 260;          // stronger tank-mode output for startup/load
+    const int TANK_MIN_EFFECTIVE_THROTTLE = 60; // overcome static friction near center
+
     // Apply dead zone: if stick is within ±5% of center (45-55), treat as 50 (neutral)
     int ch2_value = duty[2];
     int ch1_value = duty[1];
@@ -1341,16 +1376,24 @@ void loop()
       motorL = 0;
       motorR = 0;
     } else {
-      // Calculate motor values with dead zone applied (original -100 to 100 range)
-      motorL = map(ch2_value, 0, 100, -100, 100) + map(ch1_value, 0, 100, -20, 20);
-      motorR = map(ch2_value, 0, 100, 100, -100) + map(ch1_value, 0, 100, -20, 20);
-      
-      // Clamp tank mode values to -120 to 120 to prevent exceeding limits
-      // This prevents the issue where quick stick movements can cause values to exceed 120
-      if (motorL > 120) motorL = 120;
-      if (motorL < -120) motorL = -120;
-      if (motorR > 120) motorR = 120;
-      if (motorR < -120) motorR = -120;
+      // Arcade-style tank mix:
+      // CH1 = forward/back throttle, CH2 = left/right turn
+      int throttle = map(ch1_value, 0, 100, -TANK_MAX_THROTTLE, TANK_MAX_THROTTLE);
+      int turn     = map(ch2_value, 0, 100, TANK_MAX_THROTTLE, -TANK_MAX_THROTTLE);
+      motorL = throttle + turn;
+      motorR = throttle - turn;
+
+      // Clamp before applying minimum effective throttle.
+      if (motorL > TANK_MAX_THROTTLE) motorL = TANK_MAX_THROTTLE;
+      if (motorL < -TANK_MAX_THROTTLE) motorL = -TANK_MAX_THROTTLE;
+      if (motorR > TANK_MAX_THROTTLE) motorR = TANK_MAX_THROTTLE;
+      if (motorR < -TANK_MAX_THROTTLE) motorR = -TANK_MAX_THROTTLE;
+
+      // Add minimum effective throttle to improve startup torque from standstill.
+      if (motorL > 0 && motorL < TANK_MIN_EFFECTIVE_THROTTLE) motorL = TANK_MIN_EFFECTIVE_THROTTLE;
+      if (motorL < 0 && motorL > -TANK_MIN_EFFECTIVE_THROTTLE) motorL = -TANK_MIN_EFFECTIVE_THROTTLE;
+      if (motorR > 0 && motorR < TANK_MIN_EFFECTIVE_THROTTLE) motorR = TANK_MIN_EFFECTIVE_THROTTLE;
+      if (motorR < 0 && motorR > -TANK_MIN_EFFECTIVE_THROTTLE) motorR = -TANK_MIN_EFFECTIVE_THROTTLE;
     }
   }
   else
@@ -1365,6 +1408,11 @@ void loop()
     LEDStatus = "armed";
   }
   
+  // Last-line safety: never leave motors running if link was lost this iteration.
+  if (!rc_status) {
+    failsafe();
+  }
+
   updateLED();
   update_motors();
   
