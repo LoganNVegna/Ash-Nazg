@@ -1,0 +1,6 @@
+.pio/
+captures/
+tests/generated/
+__pycache__/
+*.obj
+*.exe

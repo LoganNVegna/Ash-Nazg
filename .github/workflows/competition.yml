@@ -1,0 +1,43 @@
+name: Competition firmware
+
+on:
+  push:
+    paths:
+      - 'Code/Competition_PlatformIO/**'
+      - '.github/workflows/competition.yml'
+  pull_request:
+    paths:
+      - 'Code/Competition_PlatformIO/**'
+      - '.github/workflows/competition.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-control:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Code/Competition_PlatformIO
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install platformio==6.1.18
+      - run: pio run -e upload_ota
+      - run: python tests/run_host_tests.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: competition-1.2-ota-image
+          path: Code/Competition_PlatformIO/.pio/build/upload_ota/firmware.bin
+          if-no-files-found: error
+  windows-downloader:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python Code/Competition_PlatformIO/tests/test_download_helper.py
