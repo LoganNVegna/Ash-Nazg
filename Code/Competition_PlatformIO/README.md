@@ -2,7 +2,7 @@
 
 Competition firmware for the existing Adafruit QT Py ESP32-S3 (8 MB flash, no PSRAM), H3LIS331DL accelerometer, Repeat AM32 drive ESCs and existing radio/wiring. This is the 1.2 behavior tested by the operator: stable heading, smooth correct-direction translation and acceptable speed. It does not add the subsequently discussed translation boosts.
 
-`../V5_PlatformIO` is preserved as historical firmware. This project is the current competition candidate. Software checks pass; the physical sign-off items in [RELEASE.md](RELEASE.md) still apply. Routine CSV downloads are optional.
+`../V5_PlatformIO` is preserved as historical firmware. This project is the operator-approved competition release for the tested setup and conditions. Software checks pass; operator sign-off and the reusable physical checklist are recorded in [RELEASE.md](RELEASE.md). Routine CSV downloads are optional.
 
 ## Wi-Fi upload
 

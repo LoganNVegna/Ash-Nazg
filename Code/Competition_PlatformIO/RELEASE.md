@@ -1,5 +1,11 @@
 # Competition 1.2 release checklist
 
+## Operator sign-off — 2026-10-02
+
+The operator reported testing every checklist item within the capabilities of the available setup and equipment, with all observed behavior appearing satisfactory. Competition 1.2 is accepted for those tested conditions. No further translation-strength changes are included in this release.
+
+The report does not provide a measured maximum RPM or independent confirmation of conditions beyond those exercised. The +/-400 g sensor limit and the operating-range limitations below still apply. The assistant has not operated the robot or independently witnessed these checks.
+
 ## Scope frozen
 
 Keep the operator-approved 1.2 control behavior: full-cosine translation, current strength/headroom/deadband, fresh-sample estimator, continuous heading, fractional trim LEDs, receiver-loss inhibition and Wi-Fi OTA. No additional strength boost, braking/reversal change, peripheral rewrite or radio remapping is part of this release.
@@ -18,7 +24,7 @@ Keep the operator-approved 1.2 control behavior: full-cosine translation, curren
 - Operator reports 1.2 heading and translation are smooth/controllable, correct-direction and acceptable in speed.
 - Earlier captured 1.1 session ended normally on CH5 with no sensor/fatal/DShot API error, and trim 1.008 persisted.
 
-## Physical sign-off still required unless already checked
+## Physical checklist for sign-off and future events
 
 No routine capture/download is needed for these observations. Use an enclosed test area.
 
@@ -29,4 +35,4 @@ No routine capture/download is needed for these observations. Use an enclosed te
 5. **Operating envelope:** briefly check the highest spin rate and translation strength intended for competition, within the sensor range. Confirm controllability, heading, CH5 stop and no abnormal heating/reset/fault. Low-speed success does not validate the high-speed behavior that prompted the original review.
 6. **Power-cycle persistence:** stopped trim saves successfully; after an intentional restart it is retained and arming is again inhibited at boot.
 
-Mark this revision competition-ready only after these physical behaviors are confirmed. This document records a candidate and does not imply unperformed hardware validation. If a check fails, stop and inspect the summary; obtain a capture only when it will help diagnose the failure.
+The operator sign-off above applies to the tested setup and conditions. Repeat relevant checks after hardware, radio, ESC or firmware changes, or before using a higher untested spin range. If a check fails, stop and inspect the summary; obtain a capture only when it will help diagnose the failure.
