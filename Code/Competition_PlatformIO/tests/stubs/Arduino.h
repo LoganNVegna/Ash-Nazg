@@ -33,6 +33,8 @@ struct FakeUart {
     int read(){auto b=bytes.front();bytes.pop_front();return b;}
 };
 inline FakeUart Serial1;
-inline size_t strlcpy(char* dst,const char* src,size_t cap){size_t n=strlen(src);if(cap){size_t k=std::min(n,cap-1);memcpy(dst,src,k);dst[k]=0;}return n;}
+// A distinct name avoids redeclaring the fortified glibc implementation.
+inline size_t ashMockStrlcpy(char* dst,const char* src,size_t cap){size_t n=strlen(src);if(cap){size_t k=std::min(n,cap-1);memcpy(dst,src,k);dst[k]=0;}return n;}
+#define strlcpy ashMockStrlcpy
 struct FakeSerial { template<class T> void print(T){} template<class T> void println(T){} };
 static FakeSerial Serial;
