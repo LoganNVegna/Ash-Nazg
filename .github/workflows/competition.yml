@@ -30,7 +30,7 @@ jobs:
       - run: python tests/run_host_tests.py
       - uses: actions/upload-artifact@v4
         with:
-          name: competition-1.2-ota-image
+          name: competition-1.4-ota-image
           path: Code/Competition_PlatformIO/.pio/build/upload_ota/firmware.bin
           if-no-files-found: error
   windows-downloader:

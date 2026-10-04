@@ -9,6 +9,7 @@ public:
     uint32_t lastRcUs = 0, lastLinkUs = 0, frames = 0, linkFrames = 0, crcErrors = 0, lengthErrors = 0;
     uint8_t lq = 255;
     bool haveChannels = false, linkLost = false;
+    void resetParser(){used=0;previousByteUs=0;}
     static uint8_t crc(const uint8_t* p, unsigned n) {
         uint8_t c = 0;
         while (n--) { c ^= *p++; for (int i = 0; i < 8; ++i) c = (c & 0x80) ? uint8_t((c << 1) ^ 0xd5) : uint8_t(c << 1); }

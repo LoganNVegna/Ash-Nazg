@@ -21,7 +21,9 @@ if msvc:
     os.environ['PATH'] = str(Path(compiler).parent) + os.pathsep + os.environ.get('PATH', '')
 suites = [
     ('control', ['tests/test_control.cpp'], ['include']),
-    ('driver', ['tests/generated/driver.cpp', 'tests/generated/test_driver.cpp'], ['tests/stubs', 'src']),
+    ('recovery', ['tests/test_recovery.cpp'], ['include']),
+    ('driver', ['tests/generated/driver.cpp', 'tests/generated/test_driver.cpp'], ['tests/stubs', 'src', 'include', 'tests']),
+    ('runtime', ['tests/generated/driver.cpp', 'tests/test_runtime.cpp'], ['tests/stubs', 'src', 'include', 'tests']),
     ('export', ['tests/test_csv_export.cpp'], ['include']),
 ]
 with tempfile.TemporaryDirectory(prefix='ashnazg-tests-') as scratch:
@@ -37,4 +39,5 @@ with tempfile.TemporaryDirectory(prefix='ashnazg-tests-') as scratch:
             args += [str(project / s) for s in sources] + ['-o', str(exe)]
         subprocess.run(args, cwd=scratch, check=True)
         subprocess.run([str(exe)], check=True)
-print('PASS: competition firmware image, control, driver, and export regression suites.')
+        if name=='runtime':subprocess.run([str(exe),'--no-sensor'],check=True)
+print('PASS: competition image, control, recovery, actual runtime/transport/maintenance, and export suites.')

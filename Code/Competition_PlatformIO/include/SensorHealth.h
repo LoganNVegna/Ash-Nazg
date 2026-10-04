@@ -11,7 +11,7 @@ struct SensorRegisters {
     uint8_t who=0,ctrl1=0,ctrl4=0;
     bool valid()const{return who==0x32 && ctrl1==0x37 && ctrl4==0xb0;}
 };
-// Retry reads only: never rewrite configuration while the robot may be armed.
+// Read retries are bounded; the SPI owner repairs configuration independently.
 template<class Read,class Pause>
 bool verifySensorRegisters(Read read,Pause pause,SensorRegisters& last,
                            SensorRegisters& lastBad,uint32_t& badReads) {

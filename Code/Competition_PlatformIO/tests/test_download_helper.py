@@ -51,6 +51,9 @@ try:
     state.update(build='AshNazg competition 1.2',id='abcdef55-800')
     result=run();assert result.returncode==0,result.stdout+result.stderr
     assert (scratch/'captures/run-abcdef55-800/AshNazg-competition.csv').read_bytes()==body
+    state.update(build='AshNazg competition 1.4',id='abcdef66-800')
+    result=run();assert result.returncode==0,result.stdout+result.stderr
+    assert (scratch/'captures/run-abcdef66-800/AshNazg-competition.csv').read_bytes()==body
     state.update(build='AshNazg powered V5 baseline 1.1',id='abcdef44-800')
     result=run();assert result.returncode!=0 and 'Unsupported export format' in result.stderr,result.stdout+result.stderr
     assert not (scratch/'captures/run-abcdef44-800').exists()
@@ -61,5 +64,5 @@ try:
     assert (folder/'AshNazg-competition-summary.txt').is_file()
     assert (folder/'part-0000.csv').is_file()
     assert not (folder/'AshNazg-competition.csv').exists()
-    print('PASS: competition 1.0/1.1/1.2 download 800 rows byte-for-byte; incompatible builds/corrupt pages rejected; summary and earlier pages preserved.')
+    print('PASS: competition 1.0/1.1/1.2/1.4 download 800 rows byte-for-byte; incompatible builds/corrupt pages rejected; summary and earlier pages preserved.')
 finally:server.shutdown();server.server_close();thread.join();workspace.cleanup()

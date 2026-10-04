@@ -5,11 +5,11 @@
 
 namespace ash {
 constexpr float SENSOR_G_PER_COUNT=0.195f, SENSOR_RADIUS_M=0.018f;
-constexpr uint32_t RC_TIMEOUT_US=100000, LINK_TIMEOUT_US=1000000;
-constexpr uint32_t SENSOR_TIMEOUT_US=100000, MAIN_TIMEOUT_US=50000;
+constexpr uint32_t RC_TIMEOUT_US=5000000, ARM_FRAME_US=250000;
 inline float clamp(float v,float lo,float hi){return v<lo?lo:(v>hi?hi:v);}
 inline uint32_t age(uint32_t now,uint32_t before){return now-before;}
 inline float wrap(float v){v=fmodf(v,360.0f);return v<0?v+360:v;}
+inline bool markerWindow(float phase,float center,float rpm){float d=fabsf(wrap(phase-center+180)-180);return d<=fminf(35,fmaxf(7.5f,fabsf(rpm)*0.000006f*800));}
 inline float rpmFromG(float g){return sqrtf(fabsf(g)*9.80665f/SENSOR_RADIUS_M)*9.549296586f;}
 inline int channelPercent(uint16_t raw) {
     // Preserve the original library's rcToUs conversion and Arduino map truncation.
@@ -18,19 +18,19 @@ inline int channelPercent(uint16_t raw) {
 }
 struct Rc {
     int16_t ch[8]={50,50,0,50,100,0,50,50};
-    uint32_t time=0,linkTime=0,frames=0,crcErrors=0;
+    uint32_t time=0,linkTime=0,frames=0,crcErrors=0,liveTime=0,sequence=0;
     uint8_t lq=0;
-    bool seen=false,linkSeen=false;
+    bool seen=false,linkSeen=false,liveSeen=false,reportedLoss=false;
 };
 inline bool neutral(const Rc& r){return r.ch[2]<=10 && r.ch[0]>=45 && r.ch[0]<=55 && r.ch[1]>=45 && r.ch[1]<=55;}
-inline bool rcFresh(const Rc& r,uint32_t now){return r.seen && age(now,r.time)<=RC_TIMEOUT_US;}
-inline bool linkHealthy(const Rc& r,uint32_t now){return r.linkSeen && r.lq>0 && age(now,r.linkTime)<=LINK_TIMEOUT_US;}
+inline bool rcFresh(const Rc& r,uint32_t now){return r.liveSeen && age(now,r.liveTime)<RC_TIMEOUT_US;}
+inline bool liveFrame(const Rc& r,uint32_t now){return r.liveSeen && !r.reportedLoss && age(now,r.liveTime)<=ARM_FRAME_US;}
 struct Sensor {
-    uint32_t time=0,polls=0,fresh=0,overruns=0;
+    uint32_t time=0,polls=0,fresh=0,overruns=0,acceptedTime=0,accepted=0,rejected=0,recoveries=0,rails=0;
     int16_t x=0,y=0,z=0;
     float biasCounts=0,radialG=0,filteredG=0,rpm=0;
     uint8_t status=0,who=0,ctrl1=0,ctrl4=0;
-    bool calibrated=false,rail=false,failed=false;
+    bool calibrated=false,biasKnown=false,rail=false,failed=false,impact=false;
 };
 struct Estimator {
     float filtered=0;uint32_t previous=0;bool have=false;
@@ -40,41 +40,36 @@ struct Estimator {
         previous=now;
     }
 };
+// Legacy CSV numbers remain stable; 1.4 emits only BOOT/KILL/RC_STALE/OTA.
 enum class Stop:uint8_t {BOOT,KILL,RC_STALE,LINK_LOST,SENSOR_STALE,MAIN_STALE,OUTPUT_ERROR,SENSOR_RAIL,INIT_FAILED,OTA};
 inline const char* stopName(Stop s) {
     const char* n[]={"boot","CH5_high","RC_stale","receiver_link_lost","sensor_fresh_sample_stale","main_loop_stale","DShot_API_error","sensor_saturated","initialization_failed","OTA"};
     return n[unsigned(s)];
 }
-struct SafetyInputs {Rc rc;Sensor sensor;uint32_t heartbeat=0;bool ready=false,fatal=false,updating=false,exporting=false,saving=false;};
-inline Stop fault(const SafetyInputs& i,uint32_t now) {
-    if(i.updating)return Stop::OTA;
-    if(i.fatal || i.sensor.failed)return Stop::INIT_FAILED;
-    if(i.rc.ch[4]>50)return Stop::KILL;
-    if(!rcFresh(i.rc,now))return Stop::RC_STALE;
-    if(!linkHealthy(i.rc,now))return Stop::LINK_LOST;
-    if(age(now,i.heartbeat)>MAIN_TIMEOUT_US)return Stop::MAIN_STALE;
-    if(!i.sensor.calibrated || age(now,i.sensor.time)>SENSOR_TIMEOUT_US)return Stop::SENSOR_STALE;
-    if(i.sensor.rail)return Stop::SENSOR_RAIL;
-    return Stop::BOOT;
-}
+// Component health is deliberately absent: it cannot disarm the operator.
+struct SafetyInputs {Rc rc;bool ready=false,updating=false,exporting=false,saving=false;};
 struct ArmGate {
     bool armed=false,seenHigh=false;Stop stop=Stop::BOOT;
-    uint32_t stoppedAt=0,generation=0;bool everStopped=false;
+    uint32_t stoppedAt=0,generation=0,lastSequence=0;bool everStopped=false;
     void disarm(Stop why,uint32_t now) {
         if(armed){stoppedAt=now;everStopped=true;stop=why;}
         armed=false;seenHigh=false;
     }
     bool step(const SafetyInputs& i,uint32_t now) {
-        if(!i.ready || i.fatal || i.updating || i.exporting || i.saving || i.sensor.failed) {
-            if(!armed && !everStopped && (i.fatal || i.sensor.failed))stop=Stop::INIT_FAILED;
-            disarm(i.updating?Stop::OTA:Stop::INIT_FAILED,now);return false;
+        bool newFrame=i.rc.sequence!=lastSequence;lastSequence=i.rc.sequence;
+        if(i.updating){disarm(Stop::OTA,now);return false;}
+        if(armed) {
+            if(!rcFresh(i.rc,now)){disarm(Stop::RC_STALE,now);return false;}
+            if(liveFrame(i.rc,now) && i.rc.ch[4]>50){disarm(Stop::KILL,now);return false;}
+            return true;
         }
-        if(armed){Stop why=fault(i,now);if(why!=Stop::BOOT){disarm(why,now);return false;}return true;}
-        bool healthy=rcFresh(i.rc,now) && linkHealthy(i.rc,now) && i.sensor.calibrated && !i.sensor.rail &&
-            age(now,i.sensor.time)<=SENSOR_TIMEOUT_US && age(now,i.heartbeat)<=MAIN_TIMEOUT_US;
-        if(!healthy || !neutral(i.rc)){seenHigh=false;return false;}
-        // Require control and link evidence after a stop, not a held pre-stop snapshot.
-        if(everStopped && (int32_t(i.rc.time-stoppedAt)<=0 || int32_t(i.rc.linkTime-stoppedAt)<=0))return false;
+        // Flash/export work may delay arming, never stop a running robot.
+        if(!i.ready){seenHigh=false;return false;}
+        if(i.exporting || i.saving)return false;
+        if(!newFrame || !liveFrame(i.rc,now))return false;
+        if(everStopped && int32_t(i.rc.liveTime-stoppedAt)<=0)return false;
+        // Retain neutral boot arming; recovery needs only a fresh CH5 cycle.
+        if(!everStopped && !neutral(i.rc)){seenHigh=false;return false;}
         if(i.rc.ch[4]>50)seenHigh=true;
         else if(seenHigh){armed=true;seenHigh=false;stop=Stop::BOOT;++generation;return true;}
         return false;
@@ -95,20 +90,53 @@ struct CaptureWindow {
     }
 };
 struct Mix {int16_t left=0,right=0,base=0,delta=0;float strength=0;Drive mode=Drive::STOP;};
-inline Mix melty(int throttle,int translation,bool reverse,float rpm,float phase) {
-    Mix m;if(throttle<=10)return m;
-    float requested=clamp(float(throttle*10),0,999);
-    float b=fminf(requested,floorf(0.4f*rpm)+200.0f);
+enum class Profile:uint8_t {STRONG_HALF,STRONG_FULL,BOUNDED_FULL,V5_REFERENCE};
+inline const char* profileName(Profile p){const char* names[]={"strong_half","strong_full","bounded_full","v5_reference"};return names[unsigned(p)];}
+struct Tuning {
+    Profile profile=Profile::STRONG_HALF;
+    float gain=1,phaseOffset=0,leadMs=0,rpmPerCommand=4;
+    bool diagnosticLeds=false,capture=false,robustFilter=true;
+};
+inline bool validTuning(const Tuning& t) {
+    return unsigned(t.profile)<=3 && isfinite(t.gain) && t.gain>=0 && t.gain<=1.5f &&
+        (t.profile!=Profile::BOUNDED_FULL || t.gain<=1) &&
+        isfinite(t.phaseOffset) && t.phaseOffset>=-180 && t.phaseOffset<=180 &&
+        isfinite(t.leadMs) && t.leadMs>=-20 && t.leadMs<=20 &&
+        isfinite(t.rpmPerCommand) && t.rpmPerCommand>=0.1f && t.rpmPerCommand<=20;
+}
+inline float modulationPhase(float phase,float rpm,bool reverse,const Tuning& t) {
+    // Phase is spin-relative, as in V5. A physical offset mirrors in reverse;
+    // a time lead advances along the current spin direction in either case.
+    return wrap(phase+t.phaseOffset*(reverse?-1:1)+clamp(rpm*0.006f*t.leadMs,-150,150));
+}
+// Time-based spin ramp never depends on sensor quality or an RPM-derived cap.
+struct SpinRamp {
+    float command=0;uint32_t previous=0;bool have=false;
+    float step(int throttle,bool reverse,uint32_t now) {
+        float target=throttle>10?clamp(float(throttle*10),0,999)*(reverse?-1:1):0;
+        float dt=have?fminf(age(now,previous)*1e-6f,0.05f):0;
+        previous=now;have=true;
+        if(target==0){command=0;return 0;}
+        // Operator reductions take effect immediately; ramp increases/reversal.
+        if(command*target>=0 && fabsf(target)<fabsf(command))command=target;
+        else command+=clamp(target-command,-2500*dt,2500*dt);
+        return command;
+    }
+};
+inline Mix mixMelty(float spin,int translation,bool reverse,float phase,const Tuning& t) {
+    Mix m;float b=clamp(fabsf(spin),0,999);
     float u=clamp((fabsf(float(translation-50))-10.0f)/40.0f,0,1);
-    b=fminf(b,999.0f/(1.0f+u));
-    int base=int(b),peak=int(u*base);
-    // Swapping the faster wheel on the opposite half-turn produces the same
-    // world-direction push. Use both halves without increasing peak commands.
+    float peak;
+    if(t.profile==Profile::BOUNDED_FULL){b=fminf(b,999.0f/(1.0f+u));peak=u*b;}
+    else if(t.profile==Profile::V5_REFERENCE)peak=u>0?20.0f*fabsf(float(translation-50)):0;
+    else peak=u*999;
+    peak*=t.profile==Profile::BOUNDED_FULL?fminf(t.gain,1.0f):t.gain;
     float wave=-cosf(wrap(phase)*0.01745329252f);
-    bool swap=(translation<50)^reverse;
-    int d=int(wave*peak)*(swap?-1:1);int signedBase=reverse?-base:base;
-    m.left=int16_t(signedBase+d);m.right=int16_t(signedBase-d);m.base=signedBase;m.delta=d;m.strength=u;
-    m.mode=u>0?Drive::TRANSLATE:Drive::SPIN;return m;
+    if(t.profile==Profile::STRONG_HALF || t.profile==Profile::V5_REFERENCE)wave=fmaxf(0,wave);
+    int d=int(wave*peak)*(((translation<50)^reverse)?-1:1);
+    int base=int(b)*(reverse?-1:1);
+    m.left=int16_t(clamp(float(base+d),-999,999));m.right=int16_t(clamp(float(base-d),-999,999));
+    m.base=base;m.delta=d;m.strength=u;m.mode=u>0?Drive::TRANSLATE:Drive::SPIN;return m;
 }
 inline int mapInt(int v,int inLo,int inHi,int outLo,int outHi){return (v-inLo)*(outHi-outLo)/(inHi-inLo)+outLo;}
 inline Mix ground(const Rc& r) {
