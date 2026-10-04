@@ -1,13 +1,21 @@
-# Software validation for competition 1.2
+# Software verification — competition 1.4
 
-ESP32-S3 build using Espressif 32 6.12.0/Arduino 2.0.17, QT Py no-PSRAM board and min_spiffs layout. The separate deployment project's checked build used 199,932 bytes RAM and 832,753 bytes application flash, with an 833,120-byte OTA binary. The repository build is verified independently; exact binary hashes vary with build metadata.
+Target: QT Py ESP32-S3 no PSRAM, Espressif32 6.12.0 / Arduino 2.0.17, original min_spiffs two-slot layout, authenticated application-only espota upload. The image checker compares partitions byte-for-byte with the working OTA reference and checks image identity/size/target. Exact firmware hashes and build sizes are supplied with the deployment package.
 
-The production drivers remain byte-identical to the supplied V5 reference. Tests compile the actual startup include and driver (normalizing only a GNU macro for the host compiler) and validate the 2,500 alternating stop pairs, direction/3D settings, telemetry/checksum, packet timing and signed encoder vectors.
+Local verification on 2026-10-04 passed the target build, all five host suites (including both runtime scenarios), and the Windows PowerShell download tests. Static RAM: 86,764 bytes / 327,680; flash: 844,465 / 1,966,080; application image: 844,832 bytes. These are software results for the current source, not physical acceptance.
 
-Portable production-code suites verify sensor scale, 20 ms filtering, phase continuity/rollover, calibration taking 2.8 seconds, timeout preventing late calibration, transient/persistent register verification, fractional LEDs/trim bounds/storage checksums, receiver CRC/frame freshness, link statistics, stop/rearm guards and OTA/export/flash inhibition.2,181,600 mixer cases cover both spin directions, throttle 11-100, all 101 CH2 positions and 3-degree phase steps. Full cosine obeys paired command/headroom/no-wheel-reversal bounds and opposite-phase symmetry. The ideal directional projection doubles the prior half-wave result; physical force/speed is not measured by this test.
+## Executable checks
 
-Capture tests preserve driving plus a one-second tail through 20 seconds idle, resume logging on activity and retain the final stop row. Export tests cover formatting, byte slices, partial writes/EAGAIN, stalls, disconnects and timer rollover. Windows mock-server tests exercise the actual downloader with 1.0/1.1/1.2 labels, reject incompatible formats/corrupt pages and preserve previously downloaded evidence.
+- Sensor scaling, original 20 ms EMA, calibration timeout/rollover, bounded register retries, continuous phase, fractional trim and saved-record integrity.
+- Historical 1.2 mixer bounds separately from new production policy; 8,726,400 new-profile cases across spin directions, stick/throttle values and phase. Legal ±999 outputs remain; intentional reversal is permitted in stronger profiles, bounded-profile headroom is retained.
+- Five-second loss boundary, timestamp wraparound, boot neutral sequence, explicit CH5 recovery without neutral/sensor prerequisites, and maintained drive while optional save/export/readiness flags change.
+- Prediction through missing/clipped measurements, smooth measurement return, isolated shock/transverse/sign rejection, confirmed genuine changes, phase offset/lead, spin ramp and event/timing counters.
+- Actual production channel lifecycle and driver: 2,500 stops and ten direction/ten 3D packets per ESC, signed encoder/checksum/pulse timings, explicit zero terminator, one busy response, sibling continuation and independent recovery.
+- Actual production UART/SPI/output/maintenance routines compiled against mocks: near-rail input, missing/bad configuration and automatic return, absent sensor at boot, cooperative operation with all task allocations failing, retries when allocation resumes, explicit RF-loss held frames, CH5 recovery, NVS failure, OTA error callbacks and subsequent maintenance/rearm.
+- Existing CSV formatting/ranges/partial writes/stalls/disconnects/rollover and actual PowerShell downloader against paged HTTP responses. Current and legacy build labels, corrupted pages and incompatible builds are checked.
 
-The firmware image checker verifies target/build identity, size, original partition-table equivalence and espota/authentication. Firmware/reference libraries and tests retain their original licenses. The preserved source reference is for driver integrity and historical comparison.
+The runtime/adapter/settings/OTA functions are taken directly from production source, not reimplemented in tests. Host compilation uses C++17/MSVC or GCC; MCU compilation uses the pinned toolchain. The driver source is intentionally no longer byte-identical to V5: initialization is explicit and a nonblocking one-packet startup method supports recovery. Encoding and initial packet contents remain verified against original vectors. V5 reference files are unchanged.
 
-These tests do not simulate actual UART/SPI/RMT scheduling, ESC acknowledgements, motor torque, traction, RF reporting or hardware/power failures. See RELEASE.md for observed hardware behavior and remaining sign-off. No assistant has uploaded or operated the robot.
+## Limits
+
+Mocks test control paths, not real UART timing, SPI wiring, interrupt load, watchdog/power failure, ESC acknowledgment, motor torque, braking, wheel slip, collision physics or useful high-speed translation. Phase/sign conventions require the physical comparisons in TESTING.md. The fallback rate model is unvalidated until measured. Installed receiver loss-reporting and OTA operation from the new image remain physical checks. No build or CI pass is a competition sign-off.

@@ -2,7 +2,7 @@
 // the same formatter/checksum. Nonblocking socket writes bound idle stalls.
 static unsigned exportRows(bool test) {return test ? 800 : rowsRetained;}
 static BaseRow exportRow(bool test,unsigned i) {
-    if(!test)return baseRows[(writeIndex+1500-rowsRetained+i)%1500];
+    if(!test)return baseRows[(writeIndex+BASE_ROW_CAPACITY-rowsRetained+i)%BASE_ROW_CAPACITY];
     BaseRow r{};r.us=i*10000;r.sensorUs=r.us;r.polls=i*10;r.fresh=i;r.x=i%10;r.y=-int(i%20);
     r.z=1;r.ch3=15;r.translation=50;r.wantedL=r.wantedR=r.left=r.right=150;
     r.bodyRpm=600;r.phase=i%360;r.trim=1;r.status=15;r.outputTicks=i*60;return r;

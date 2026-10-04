@@ -57,7 +57,7 @@ esp_err_t DShotESC::install(gpio_num_t gpio, rmt_channel_t rmtChannel, unsigned 
 	divider = rmtdivider;
 	
 
-	rmt_config_t config;
+	rmt_config_t config{};
 
 	config.channel = rmtChannel;
 	config.rmt_mode = RMT_MODE_TX;
@@ -274,12 +274,19 @@ esp_err_t DShotESC::writeData(uint16_t data, bool wait)
 						   wait);
 }
 
+esp_err_t DShotESC::sendStartupCommand(DSHOT_CMD command)
+{
+	if(command!=DSHOT_CMD::SPIN_DIRECTION_NORMAL && command!=DSHOT_CMD::MODE_3D_ON)
+		return ESP_ERR_INVALID_ARG;
+	return writePacket({uint16_t(command),1},false);
+}
+
 esp_err_t DShotESC::writePacket(dshot_packet_t packet, bool wait)
 {
 	uint16_t data = packet.payload;
 
 	data <<= 1;
-	data |= packet.telemetry;
+	data |= uint16_t(packet.telemetry);
 
 	data = (data << 4) | checksum(data);
 

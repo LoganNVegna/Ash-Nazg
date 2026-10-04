@@ -59,6 +59,8 @@ public:
 	esp_err_t setReversed(bool reversed);
 	//Set bidirectionnal mode
 	esp_err_t set3DMode(bool active);
+	// One nonblocking startup packet; the owner repeats it on its schedule.
+	esp_err_t sendStartupCommand(DSHOT_CMD command);
 	//Do a beep. Tone is between 0 and 4, inclusive
 	esp_err_t beep(uint8_t tone = 0);
 	//Turn on or off a LED. There's support for up to 4 LEDs
@@ -90,9 +92,9 @@ protected:
 	rmt_item32_t _dshotCmd[17];
 	rmt_channel_t _rmtChannel;
 
-	uint16_t dt_t0h, dt_t0l, //ticks to stay low and high for a 0
-	dt_t1h, dt_t1l, //ticks to stay low and high for a one
-	dt_tpb, //total duration of a bit (ticks per bit)
-	dt_pause;
+	uint16_t dt_t0h=0, dt_t0l=0, //ticks to stay low and high for a 0
+	dt_t1h=0, dt_t1l=0, //ticks to stay low and high for a one
+	dt_tpb=0, //total duration of a bit (ticks per bit)
+	dt_pause=0;
 	uint8_t divider;
 };

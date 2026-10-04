@@ -16,7 +16,7 @@ $suffix=if($Check){'?test=1'}else{''}
 $manifest=(Get-RobotResponse "/export.json$suffix").Content | ConvertFrom-Json
 # Both releases use the same CSV/export format. Already-installed 1.1 images
 # advertise 1.0 in export.json because its label was accidentally hardcoded.
-if($manifest.build -notin @('AshNazg competition 1.0','AshNazg competition 1.1','AshNazg competition 1.2')) {
+if($manifest.build -notin @('AshNazg competition 1.0','AshNazg competition 1.1','AshNazg competition 1.2','AshNazg competition 1.3','AshNazg competition 1.4')) {
     throw "Unsupported export format '$($manifest.build)'. Keep the robot powered on and stopped; send its summary."
 }
 if($manifest.capture_id -notmatch '^[a-fA-F0-9]+-[0-9]+$'){throw 'Invalid capture ID.'}
